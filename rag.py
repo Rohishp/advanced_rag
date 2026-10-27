@@ -1,5 +1,6 @@
 import re
 from typing import List, Literal, TypedDict
+from datetime import date
 from langchain_tavily import TavilySearch
 import json
 import hashlib
@@ -139,6 +140,7 @@ class State(TypedDict, total=False):
     reason: str                 # why that verdict was chosen
     doc_reasons: List[str]      # evaluator's justification per chunk
     web_docs: List[Document]    # results from web search
+    web_query: str              # rewritten question used for web search
 
 
 def retrieve(state: State) -> State:
@@ -220,11 +222,37 @@ def eval_each_doc(state: State) -> State:
 # ---------- Node: WEB SEARCH (when the books aren't enough) ----------
 tavily = TavilySearch(max_results=5, topic="general")
 
+# ---------- Node: REWRITE question into a web search query ----------
+class WebQuery(BaseModel):
+    query: str
+
+
+rewrite_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Rewrite the user's question into a concise web search query (6-12 words).\n"
+            "Today's date is {today}. Replace relative dates like 'last week' "
+            "with explicit dates or months.\n"
+            "Output JSON only.",
+        ),
+        ("human", "Question: {question}"),
+    ]
+)
+
+rewrite_chain = rewrite_prompt | llm.with_structured_output(WebQuery)
+
+
+def rewrite_query(state: State) -> State:
+    out = rewrite_chain.invoke(
+        {"question": state["question"], "today": date.today().isoformat()}
+    )
+    return {"web_query": out.query}
 
 def web_search(state: State) -> State:
     """Search the web and turn the results into Documents."""
     try:
-        response = tavily.invoke({"query": state["question"]})
+        response = tavily.invoke({"query": state.get("web_query") or state["question"]})
     except Exception as e:  # e.g. missing API key, network error
         print(f"Web search failed: {e}")
         return {"web_docs": []}
@@ -309,7 +337,7 @@ answer_prompt = ChatPromptTemplate.from_messages(
         (
             "system",
             "You are a helpful ML tutor. Answer ONLY using the provided refined bullets.\n"
-            "If the bullets are empty or insufficient, say: 'I don't know based on the provided books.'",
+            "If the bullets are empty or insufficient, say: 'I don't know based on the available sources.'",
         ),
         ("human", "Question: {question}\n\nRefined context:\n{refined_context}"),
     ]
@@ -337,6 +365,7 @@ g.add_node("eval_each_doc", eval_each_doc)
 g.add_node("web_search", web_search)
 g.add_node("refine", refine)
 g.add_node("generate", generate)
+g.add_node("rewrite_query", rewrite_query)
 
 # START -> retrieve -> eval_each_doc -> (refine | web_search -> refine) -> generate -> END
 g.add_edge(START, "retrieve")
@@ -344,8 +373,9 @@ g.add_edge("retrieve", "eval_each_doc")
 g.add_conditional_edges(
     "eval_each_doc",
     route_after_eval,
-    {"refine": "refine", "web_search": "web_search"},
+    {"refine": "refine", "web_search": "rewrite_query"},
 )
+g.add_edge("rewrite_query", "web_search")
 g.add_edge("web_search", "refine")
 g.add_edge("refine", "generate")
 g.add_edge("generate", END)
@@ -371,10 +401,21 @@ for q in QUESTIONS:
     print("=" * 100)
     print("QUESTION:", q)
     print(f"VERDICT: {res['verdict']} ({res['reason']})")
+
+    print("=" * 100)
+
     for d, s, why in zip(res["docs"], res["doc_scores"], res["doc_reasons"]):
         print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {why}")
+
+    print("=" * 100)
+
     for d in res.get("web_docs", []):
         print(f"  web: {d.metadata['source']} ({d.metadata['url']})")
+
+    print("=" * 100)
+
+    if res.get("web_query"):
+        print(f"WEB QUERY: {res['web_query']}")
     print("\nANSWER:\n", res["answer"])
     
 # print(res["answer"])
