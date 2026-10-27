@@ -137,6 +137,7 @@ class State(TypedDict, total=False):
     good_docs: List[Document]   # chunks scoring above LOWER_TH
     verdict: Literal["CORRECT", "INCORRECT", "AMBIGUOUS"]
     reason: str                 # why that verdict was chosen
+    doc_reasons: List[str]      # evaluator's justification per chunk
 
 
 def retrieve(state: State) -> State:
@@ -181,6 +182,7 @@ def eval_each_doc(state: State) -> State:
         config={"max_concurrency": 10},
     )
     scores = [r.score for r in results]
+    reasons = [r.reason for r in results]
 
     # Chunks worth refining: anything above the lower threshold
     good = [d for d, s in zip(docs, scores) if s > LOWER_TH]
@@ -191,6 +193,7 @@ def eval_each_doc(state: State) -> State:
             "doc_scores": scores,
             "good_docs": good,
             "verdict": "CORRECT",
+            "doc_reasons": reasons,
             "reason": f"At least one retrieved chunk scored > {UPPER_TH}.",
         }
 
@@ -200,6 +203,7 @@ def eval_each_doc(state: State) -> State:
             "doc_scores": scores,
             "good_docs": [],
             "verdict": "INCORRECT",
+            "doc_reasons": reasons,
             "reason": f"All retrieved chunks scored < {LOWER_TH}. No chunk was sufficient.",
         }
 
@@ -208,6 +212,7 @@ def eval_each_doc(state: State) -> State:
         "doc_scores": scores,
         "good_docs": good,
         "verdict": "AMBIGUOUS",
+        "doc_reasons": reasons,
         "reason": f"No chunk scored > {UPPER_TH}, but not all were < {LOWER_TH}. Mixed relevance signals.",
     }
 
@@ -355,4 +360,7 @@ for i, d in enumerate(res["docs"], 1):
     print(f"[{i}] {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
     print(d.page_content[:500])
     print("*" * 100)
+
+for d, s, why in zip(res["docs"], res["doc_scores"], res["doc_reasons"]):
+    print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {why}")
 
