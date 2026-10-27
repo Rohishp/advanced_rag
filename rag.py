@@ -1,7 +1,7 @@
-from ast import List
 import re
 from typing import List, Literal, TypedDict
-
+from langchain_tavily import TavilySearch
+import json
 import hashlib
 from langchain_chroma import Chroma
 from pathlib import Path
@@ -106,7 +106,7 @@ def index_folder(folder: Path, batch_size: int = 500) -> None:
         MANIFEST.write_text(json.dumps(manifest, indent=2))
 
 
-
+index_folder(DOCS_DIR)
 # The retriever finds chunks for a question.
 # MMR = fetch the 20 most similar chunks, then pick 4 that are relevant
 # AND different from each other (avoids 4 near-duplicate passages).
@@ -138,6 +138,7 @@ class State(TypedDict, total=False):
     verdict: Literal["CORRECT", "INCORRECT", "AMBIGUOUS"]
     reason: str                 # why that verdict was chosen
     doc_reasons: List[str]      # evaluator's justification per chunk
+    web_docs: List[Document]    # results from web search
 
 
 def retrieve(state: State) -> State:
@@ -216,6 +217,29 @@ def eval_each_doc(state: State) -> State:
         "reason": f"No chunk scored > {UPPER_TH}, but not all were < {LOWER_TH}. Mixed relevance signals.",
     }
 
+# ---------- Node: WEB SEARCH (when the books aren't enough) ----------
+tavily = TavilySearch(max_results=5, topic="general")
+
+
+def web_search(state: State) -> State:
+    """Search the web and turn the results into Documents."""
+    try:
+        response = tavily.invoke({"query": state["question"]})
+    except Exception as e:  # e.g. missing API key, network error
+        print(f"Web search failed: {e}")
+        return {"web_docs": []}
+
+    results = response.get("results", []) if isinstance(response, dict) else []
+    web_docs = [
+        Document(
+            page_content=r.get("content", ""),  # only the text gets refined
+            metadata={"source": r.get("title", "web"), "url": r.get("url", "")},
+        )
+        for r in results
+        if r.get("content")
+    ]
+    return {"web_docs": web_docs}
+
 # ---------- Helper: DECOMPOSE ----------
 def decompose_to_sentences(text: str) -> List[str]:
     """Split a block of text into sentences ("strips")."""
@@ -252,9 +276,9 @@ filter_chain = filter_prompt | llm.with_structured_output(KeepOrDrop)
 def refine(state: State) -> State:
     q = state["question"]
 
-    # Merge the retrieved chunks into one big text
-    context = "\n\n".join(d.page_content for d in state["good_docs"]).strip()
-
+    # Book chunks the evaluator kept + web results (either may be empty)
+    docs = state.get("good_docs", []) + state.get("web_docs", [])
+    context = "\n\n".join(d.page_content for d in docs).strip()
     # 1) DECOMPOSE: text -> list of sentences
     strips = decompose_to_sentences(context)
 
@@ -300,43 +324,31 @@ def generate(state: State) -> State:
     return {"answer": out.content}  # .content = the text of the reply
 
 
-# ---------- Node: NO ANSWER (retrieval failed) ----------
-def no_answer(state: State) -> State:
-    """Skip refine/generate when nothing relevant was retrieved."""
-    return {
-        "strips": [],
-        "kept_strips": [],
-        "refined_context": "",
-        "answer": f"I don't know based on the provided books. ({state['reason']})",
-    }
-
 
 def route_after_eval(state: State) -> str:
     """Pick the next node based on the evaluator's verdict."""
     if state["verdict"] == "INCORRECT":
-        return "no_answer"
-    return "refine"   # CORRECT and AMBIGUOUS both refine the good chunks
+        return "web_search"
+    return "refine"   # CORRECT and AMBIGUOUS refine the good chunks
 
 g = StateGraph(State)
 g.add_node("retrieve", retrieve)
+g.add_node("eval_each_doc", eval_each_doc)
+g.add_node("web_search", web_search)
 g.add_node("refine", refine)
 g.add_node("generate", generate)
 
-g.add_node("eval_each_doc", eval_each_doc)
-
-
-
-# Straight line: START -> retrieve -> refine -> generate -> END
+# START -> retrieve -> eval_each_doc -> (refine | web_search -> refine) -> generate -> END
 g.add_edge(START, "retrieve")
 g.add_edge("retrieve", "eval_each_doc")
-g.add_node("no_answer", no_answer)
-
 g.add_conditional_edges(
     "eval_each_doc",
     route_after_eval,
-    {"refine": "refine", "no_answer": "no_answer"},
+    {"refine": "refine", "web_search": "web_search"},
 )
-g.add_edge("no_answer", END)
+g.add_edge("web_search", "refine")
+g.add_edge("refine", "generate")
+g.add_edge("generate", END)
 
 app = g.compile()  # turn the definition into a runnable app
 
@@ -347,26 +359,42 @@ except Exception:
     print(app.get_graph().draw_mermaid())   # offline fallback: Mermaid text
     
 # 5) Run
-res = app.invoke({"question": "What is the capital of India?"})
+# 
+QUESTIONS = [
+    "Explain the bias–variance tradeoff",                                     # expect CORRECT
+    "What are attention mechanisms and why are they important in current models?",  # likely AMBIGUOUS
+    "AI news from last week",                                                 # expect INCORRECT
+]
 
-print(res["answer"])
-print()
+for q in QUESTIONS:
+    res = app.invoke({"question": q})
+    print("=" * 100)
+    print("QUESTION:", q)
+    print(f"VERDICT: {res['verdict']} ({res['reason']})")
+    for d, s, why in zip(res["docs"], res["doc_scores"], res["doc_reasons"]):
+        print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {why}")
+    for d in res.get("web_docs", []):
+        print(f"  web: {d.metadata['source']} ({d.metadata['url']})")
+    print("\nANSWER:\n", res["answer"])
+    
+# print(res["answer"])
+# print()
 
-print(f"Verdict: {res['verdict']} ({res['reason']})")
-for d, s in zip(res["docs"], res["doc_scores"]):
-    print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
-print("*" * 100)
+# print(f"Verdict: {res['verdict']} ({res['reason']})")
+# for d, s in zip(res["docs"], res["doc_scores"]):
+#     print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
+# print("*" * 100)
 
-print(f"Kept {len(res['kept_strips'])} of {len(res['strips'])} sentences:")
-for s in res["kept_strips"]:
-    print("-", s)
-print("*" * 100)
+# print(f"Kept {len(res['kept_strips'])} of {len(res['strips'])} sentences:")
+# for s in res["kept_strips"]:
+#     print("-", s)
+# print("*" * 100)
 
-for i, d in enumerate(res["docs"], 1):
-    print(f"[{i}] {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
-    print(d.page_content[:500])
-    print("*" * 100)
+# for i, d in enumerate(res["docs"], 1):
+#     print(f"[{i}] {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
+#     print(d.page_content[:500])
+#     print("*" * 100)
 
-for d, s, why in zip(res["docs"], res["doc_scores"], res["doc_reasons"]):
-    print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {why}")
+# for d, s, why in zip(res["docs"], res["doc_scores"], res["doc_reasons"]):
+#     print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {why}")
 
