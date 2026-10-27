@@ -1,8 +1,8 @@
 from typing import List, TypedDict
 import time
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.vectorstores import FAISS
+from pathlib import Path
+import pymupdf4llm
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
@@ -13,22 +13,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-docs = (
-    PyPDFLoader("./documents/book1.pdf").load() +
-    PyPDFLoader("./documents/book2.pdf").load() +
-    PyPDFLoader("./documents/book3.pdf").load()
-)
+DOCS_DIR = Path("./documents")
 
-len(docs)
+def clean(text: str) -> str:
+    # strip lone surrogates from PDF extraction
+    return text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+
+def load_pdf(path: Path) -> list[Document]:
+    pages = pymupdf4llm.to_markdown(str(path), page_chunks=True)
+    return [
+        Document(
+            page_content=clean(p["text"]),
+            metadata={
+                "source": path.name,
+                "page": p["metadata"].get("page") or p["metadata"].get("page_number") or n,
+            },
+        )
+        for n, p in enumerate(pages, 1)
+        if p["text"].strip()
+    ]
+
+docs = [d for pdf in sorted(DOCS_DIR.glob("*.pdf")) for d in load_pdf(pdf)]
 
 # 2) Chunk
 chunks =  RecursiveCharacterTextSplitter.from_tiktoken_encoder(
     chunk_size=512, chunk_overlap=64
     ).split_documents(docs)
 
-# 3) Clean text to avoid UnicodeEncodeError (surrogates from PDF extraction)
-for d in chunks:
-    d.page_content = d.page_content.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
 # 3) Index (fresh collection each run)
 embeddings = OpenAIEmbeddings(model='text-embedding-3-large')
