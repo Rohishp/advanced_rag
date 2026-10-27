@@ -1,5 +1,6 @@
 from ast import List
-from typing import TypedDict
+import re
+from typing import List, TypedDict
 
 import hashlib
 from langchain_chroma import Chroma
@@ -94,14 +95,56 @@ structured_llm = llm.with_structured_output(CitedAnswer)
 class State(TypedDict, total=False):
     question: str
     docs: list[Document]
+    strips: List[str]
+    kept_strips: List[str]
+    refined_context: str
     answer: str
     citations: list[int]
-
 
 def retrieve(state: State) -> State:
     q = state["question"]
     return {"docs": retriever.invoke(q)}
 
+def decompose_to_sentences(text: str) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in sentences if len(s.strip()) > 20]
+
+
+class KeepOrDrop(BaseModel):
+    keep: bool
+
+
+filter_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a strict relevance filter.\n"
+            "Return keep=true only if the sentence directly helps answer the question.\n"
+            "Use ONLY the sentence. Output JSON only.",
+        ),
+        ("human", "Question: {question}\n\nSentence:\n{sentence}"),
+    ]
+)
+
+filter_chain = filter_prompt | llm.with_structured_output(KeepOrDrop)
+
+
+def refine(state: State) -> State:
+    q = state["question"]
+    context = "\n\n".join(d.page_content for d in state["docs"]).strip()
+    strips = decompose_to_sentences(context)
+    results = filter_chain.batch(
+        [{"question": q, "sentence": s} for s in strips],
+        config={"max_concurrency": 10},
+    )
+    kept = [s for s, r in zip(strips, results) if r.keep]
+    refined_context = "\n".join(kept).strip()
+    return {
+        "strips": strips,
+        "kept_strips": kept,
+        "refined_context": refined_context,
+    }
 
 prompt = ChatPromptTemplate.from_messages([
     ("system",
@@ -124,17 +167,24 @@ def generate(state: State) -> State:
     return {"answer": out.answer, "citations": out.citations}
 
 
-g = StateGraph(State)
-g.add_node("retrieve", retrieve)
-g.add_node("generate", generate)
-g.add_edge(START, "retrieve")
-g.add_edge("retrieve", "generate")
-g.add_edge("generate", END)
-app = g.compile()
+graph = StateGraph(State)
+graph.add_node("retrieve", retrieve)
+graph.add_node("refine", refine)
+graph.add_node("generate", generate)
+graph.add_edge(START, "retrieve")
+graph.add_edge("retrieve", "refine")
+graph.add_edge("refine", "generate")
+graph.add_edge("generate", END)
+app = graph.compile()
 
 # 5) Run
 res = app.invoke({"question": "What is a transformer in deep learning?"})
 print(res["answer"], "\n")
+print(f"Kept {len(res['kept_strips'])} of {len(res['strips'])} sentences:")
+for s in res["kept_strips"]:
+    print("-", s)
+print("*" * 100)
+
 for n in res["citations"]:
     d = res["docs"][n - 1]
     print(f"[{n}] {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
