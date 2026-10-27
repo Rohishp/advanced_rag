@@ -307,7 +307,7 @@ def no_answer(state: State) -> State:
         "strips": [],
         "kept_strips": [],
         "refined_context": "",
-        "answer": "I don't know based on the provided books.",
+        "answer": f"I don't know based on the provided books. ({state['reason']})",
     }
 
 
