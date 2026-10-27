@@ -51,3 +51,35 @@ def retrieve(state):
     return {"docs": retriever.invoke(q)}
 
 
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "Answer only from the context. If not in context, say you don't know."),
+        ("human", "Question: {question}\n\nContext:\n{context}"),
+    ]
+)
+
+def generate(state):
+    context = "\n\n".join(d.page_content for d in state["docs"])
+    out = (prompt | llm).invoke({"question": state["question"], "context": context})
+    return {"answer": out.content}
+
+
+g = StateGraph(State)
+g.add_node("retrieve", retrieve)
+g.add_node("generate", generate)
+g.add_edge(START, "retrieve")
+g.add_edge("retrieve", "generate")
+g.add_edge("generate", END)
+app = g.compile()
+
+# 5) Run
+res = app.invoke({"question": "WHat is a transformer in deep learning.", "docs": [], "answer": ""})
+print(res["answer"])
+
+print(res['docs'][0].page_content)
+print('*'*100)
+print(res['docs'][1].page_content)
+print('*'*100)
+print(res['docs'][2].page_content)
+print('*'*100)
+print(res['docs'][3].page_content)
