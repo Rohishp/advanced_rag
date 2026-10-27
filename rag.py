@@ -1,6 +1,8 @@
 from typing import List, TypedDict
 import time
 
+import hashlib
+from langchain_chroma import Chroma
 from pathlib import Path
 import pymupdf4llm
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -33,17 +35,44 @@ def load_pdf(path: Path) -> list[Document]:
         if p["text"].strip()
     ]
 
-docs = [d for pdf in sorted(DOCS_DIR.glob("*.pdf")) for d in load_pdf(pdf)]
+DB_DIR = "./chroma_db"
 
-# 2) Chunk
-chunks =  RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
     chunk_size=512, chunk_overlap=64
-    ).split_documents(docs)
+)
 
+embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+vector_store = Chroma(
+    collection_name="books",
+    embedding_function=embeddings,
+    persist_directory=DB_DIR,
+)
 
-# 3) Index (fresh collection each run)
-embeddings = OpenAIEmbeddings(model='text-embedding-3-large')
-vector_store = FAISS.from_documents(chunks, embeddings)
+def chunk_id(doc: Document) -> str:
+    key = f"{doc.metadata['source']}|{doc.metadata['page']}|{doc.page_content}"
+    return hashlib.sha256(key.encode()).hexdigest()
+
+def index_folder(folder: Path, batch_size: int = 500) -> None:
+    for pdf in sorted(folder.glob("*.pdf")):
+        chunks = splitter.split_documents(load_pdf(pdf))
+
+        # de-duplicate identical chunks (same source, page, and text)
+        unique: dict[str, Document] = {}
+        for c in chunks:
+            unique.setdefault(chunk_id(c), c)
+        ids = list(unique)
+
+        existing = set(vector_store.get(ids=ids)["ids"])
+        new_ids = [i for i in ids if i not in existing]
+        for start in range(0, len(new_ids), batch_size):
+            batch = new_ids[start:start + batch_size]
+            vector_store.add_documents([unique[i] for i in batch], ids=batch)
+
+        print(f"{pdf.name}: {len(chunks)} chunks, {len(ids)} unique, "
+              f"{len(new_ids)} newly embedded")
+
+index_folder(DOCS_DIR)
+
 
 
 retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={'k':4})
