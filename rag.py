@@ -1,5 +1,5 @@
-from typing import List, TypedDict
-import time
+from ast import List
+from typing import TypedDict
 
 import hashlib
 from langchain_chroma import Chroma
@@ -91,14 +91,14 @@ class CitedAnswer(BaseModel):
 
 structured_llm = llm.with_structured_output(CitedAnswer)
 
-class State(TypedDict):
+class State(TypedDict, total=False):
     question: str
-    docs: List[Document]
+    docs: list[Document]
     answer: str
-    citations: List[int]
+    citations: list[int]
 
 
-def retrieve(state):
+def retrieve(state: State) -> State:
     q = state["question"]
     return {"docs": retriever.invoke(q)}
 
@@ -117,7 +117,7 @@ def format_context(docs: list[Document]) -> str:
         for i, d in enumerate(docs, 1)
     )
 
-def generate(state):
+def generate(state: State) -> State:
     out: CitedAnswer = (prompt | structured_llm).invoke(
         {"question": state["question"], "context": format_context(state["docs"])}
     )
@@ -133,7 +133,7 @@ g.add_edge("generate", END)
 app = g.compile()
 
 # 5) Run
-res = app.invoke({"question": "WHat is a transformer in deep learning.", "docs": [], "answer": ""})
+res = app.invoke({"question": "What is a transformer in deep learning?"})
 print(res["answer"], "\n")
 for n in res["citations"]:
     d = res["docs"][n - 1]
