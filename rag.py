@@ -248,8 +248,8 @@ def refine(state: State) -> State:
     q = state["question"]
 
     # Merge the retrieved chunks into one big text
-    context = "\n\n".join(d.page_content for d in state["docs"]).strip()
-
+    context = "\n\n".join(d.page_content for d in state["good_docs"]).strip()
+    
     # 1) DECOMPOSE: text -> list of sentences
     strips = decompose_to_sentences(context)
 
