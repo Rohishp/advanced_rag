@@ -327,9 +327,9 @@ def generate(state: State) -> State:
 
 def route_after_eval(state: State) -> str:
     """Pick the next node based on the evaluator's verdict."""
-    if state["verdict"] == "INCORRECT":
-        return "web_search"
-    return "refine"   # CORRECT and AMBIGUOUS refine the good chunks
+    if state["verdict"] == "CORRECT":
+        return "refine"      # books are enough
+    return "web_search"      # INCORRECT: web only; AMBIGUOUS: web + partial book chunks
 
 g = StateGraph(State)
 g.add_node("retrieve", retrieve)
