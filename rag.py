@@ -249,7 +249,7 @@ def refine(state: State) -> State:
 
     # Merge the retrieved chunks into one big text
     context = "\n\n".join(d.page_content for d in state["good_docs"]).strip()
-    
+
     # 1) DECOMPOSE: text -> list of sentences
     strips = decompose_to_sentences(context)
 
@@ -295,6 +295,23 @@ def generate(state: State) -> State:
     return {"answer": out.content}  # .content = the text of the reply
 
 
+# ---------- Node: NO ANSWER (retrieval failed) ----------
+def no_answer(state: State) -> State:
+    """Skip refine/generate when nothing relevant was retrieved."""
+    return {
+        "strips": [],
+        "kept_strips": [],
+        "refined_context": "",
+        "answer": "I don't know based on the provided books.",
+    }
+
+
+def route_after_eval(state: State) -> str:
+    """Pick the next node based on the evaluator's verdict."""
+    if state["verdict"] == "INCORRECT":
+        return "no_answer"
+    return "refine"   # CORRECT and AMBIGUOUS both refine the good chunks
+
 g = StateGraph(State)
 g.add_node("retrieve", retrieve)
 g.add_node("refine", refine)
@@ -307,14 +324,19 @@ g.add_node("eval_each_doc", eval_each_doc)
 # Straight line: START -> retrieve -> refine -> generate -> END
 g.add_edge(START, "retrieve")
 g.add_edge("retrieve", "eval_each_doc")
-g.add_edge("eval_each_doc", "refine")
-g.add_edge("refine", "generate")
-g.add_edge("generate", END)
+g.add_node("no_answer", no_answer)
+
+g.add_conditional_edges(
+    "eval_each_doc",
+    route_after_eval,
+    {"refine": "refine", "no_answer": "no_answer"},
+)
+g.add_edge("no_answer", END)
 
 app = g.compile()  # turn the definition into a runnable app
 
 # 5) Run
-res = app.invoke({"question": "Explain the bias–variance tradeoff"})
+res = app.invoke({"question": "What is the capital of India?"})
 
 print(res["answer"])
 print()
