@@ -1,6 +1,6 @@
 from ast import List
 import re
-from typing import List, TypedDict
+from typing import List, Literal, TypedDict
 
 import hashlib
 from langchain_chroma import Chroma
@@ -118,6 +118,9 @@ retriever = vector_store.as_retriever(
 
 # 4) LLM + prompt
 llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
+# Relevance thresholds for the retrieval evaluator
+UPPER_TH = 0.7   # above this: chunk is clearly relevant
+LOWER_TH = 0.3   # below this: chunk is irrelevant
 
 # 5) GRAPH
 class State(TypedDict, total=False):
@@ -130,17 +133,83 @@ class State(TypedDict, total=False):
     kept_strips: List[str]     # sentences the filter judged relevant
     refined_context: str       # kept sentences joined into one text
     answer: str                # final answer
-class State(TypedDict, total=False):
-    question: str
-    docs: list[Document]
-    strips: List[str]
-    kept_strips: List[str]
-    refined_context: str
-    answer: str
+    doc_scores: List[float]     # relevance score per retrieved chunk
+    good_docs: List[Document]   # chunks scoring above LOWER_TH
+    verdict: Literal["CORRECT", "INCORRECT", "AMBIGUOUS"]
+    reason: str                 # why that verdict was chosen
+
 
 def retrieve(state: State) -> State:
     q = state["question"]
     return {"docs": retriever.invoke(q)}
+
+# ---------- Node: EVALUATE retrieved chunks ----------
+class DocEvalScore(BaseModel):
+    """Structured output: relevance score plus a short justification."""
+    score: float
+    reason: str
+
+
+doc_eval_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You are a strict retrieval evaluator for RAG.\n"
+            "You will be given ONE retrieved chunk and a question.\n"
+            "Return a relevance score in [0.0, 1.0].\n"
+            "- 1.0: chunk alone is sufficient to answer fully/mostly\n"
+            "- 0.0: chunk is irrelevant\n"
+            "Be conservative with high scores.\n"
+            "Also return a short reason.\n"
+            "Output JSON only.",
+        ),
+        ("human", "Question: {question}\n\nChunk:\n{chunk}"),
+    ]
+)
+
+doc_eval_chain = doc_eval_prompt | llm.with_structured_output(DocEvalScore)
+
+
+def eval_each_doc(state: State) -> State:
+    """Score every retrieved chunk and decide CORRECT / INCORRECT / AMBIGUOUS."""
+    q = state["question"]
+    docs = state["docs"]
+
+    # Score all chunks in parallel instead of one by one
+    results = doc_eval_chain.batch(
+        [{"question": q, "chunk": d.page_content} for d in docs],
+        config={"max_concurrency": 10},
+    )
+    scores = [r.score for r in results]
+
+    # Chunks worth refining: anything above the lower threshold
+    good = [d for d, s in zip(docs, scores) if s > LOWER_TH]
+
+    # CORRECT: at least one chunk is clearly relevant
+    if any(s > UPPER_TH for s in scores):
+        return {
+            "doc_scores": scores,
+            "good_docs": good,
+            "verdict": "CORRECT",
+            "reason": f"At least one retrieved chunk scored > {UPPER_TH}.",
+        }
+
+    # INCORRECT: nothing retrieved, or every chunk is irrelevant
+    if not scores or all(s < LOWER_TH for s in scores):
+        return {
+            "doc_scores": scores,
+            "good_docs": [],
+            "verdict": "INCORRECT",
+            "reason": f"All retrieved chunks scored < {LOWER_TH}. No chunk was sufficient.",
+        }
+
+    # AMBIGUOUS: some signal, but nothing convincing
+    return {
+        "doc_scores": scores,
+        "good_docs": good,
+        "verdict": "AMBIGUOUS",
+        "reason": f"No chunk scored > {UPPER_TH}, but not all were < {LOWER_TH}. Mixed relevance signals.",
+    }
 
 # ---------- Helper: DECOMPOSE ----------
 def decompose_to_sentences(text: str) -> List[str]:
@@ -231,9 +300,14 @@ g.add_node("retrieve", retrieve)
 g.add_node("refine", refine)
 g.add_node("generate", generate)
 
+g.add_node("eval_each_doc", eval_each_doc)
+
+
+
 # Straight line: START -> retrieve -> refine -> generate -> END
 g.add_edge(START, "retrieve")
-g.add_edge("retrieve", "refine")
+g.add_edge("retrieve", "eval_each_doc")
+g.add_edge("eval_each_doc", "refine")
 g.add_edge("refine", "generate")
 g.add_edge("generate", END)
 
@@ -245,6 +319,11 @@ res = app.invoke({"question": "Explain the bias–variance tradeoff"})
 print(res["answer"])
 print()
 
+print(f"Verdict: {res['verdict']} ({res['reason']})")
+for d, s in zip(res["docs"], res["doc_scores"]):
+    print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
+print("*" * 100)
+
 print(f"Kept {len(res['kept_strips'])} of {len(res['strips'])} sentences:")
 for s in res["kept_strips"]:
     print("-", s)
@@ -254,3 +333,4 @@ for i, d in enumerate(res["docs"], 1):
     print(f"[{i}] {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
     print(d.page_content[:500])
     print("*" * 100)
+
