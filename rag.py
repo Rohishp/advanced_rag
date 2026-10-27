@@ -1,5 +1,6 @@
 import re
-from typing import List, Literal, TypedDict
+from typing import List, Literal, Optional, TypedDict
+from pydantic import BaseModel, Field
 from datetime import date
 from langchain_tavily import TavilySearch
 import json
@@ -12,7 +13,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
-from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 
@@ -141,6 +141,7 @@ class State(TypedDict, total=False):
     doc_reasons: List[str]      # evaluator's justification per chunk
     web_docs: List[Document]    # results from web search
     web_query: str              # rewritten question used for web search
+    web_time_range: Optional[str]   # Tavily recency filter: day / week / month / year
 
 
 def retrieve(state: State) -> State:
@@ -224,17 +225,25 @@ tavily = TavilySearch(max_results=5, topic="general")
 
 # ---------- Node: REWRITE question into a web search query ----------
 class WebQuery(BaseModel):
-    query: str
+    query: str = Field(description="Keyword web search query, 6-14 words.")
+    time_range: Optional[Literal["day", "week", "month", "year"]] = Field(
+        default=None,
+        description="Recency filter if the question asks for recent information, otherwise null.",
+    )
 
 
 rewrite_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "Rewrite the user's question into a concise web search query (6-12 words).\n"
-            "Today's date is {today}. Replace relative dates like 'last week' "
+            "Rewrite the user question into a web search query composed of keywords.\n"
+            "Rules:\n"
+            "- Keep it short (6-14 words).\n"
+            "- Today's date is {today}. Replace relative dates (e.g. 'last week') "
             "with explicit dates or months.\n"
-            "Output JSON only.",
+            "- If the question asks for recent information (recent/latest/last week/"
+            "last month), set time_range to day, week, month or year. Otherwise leave it null.\n"
+            "- Do NOT answer the question.",
         ),
         ("human", "Question: {question}"),
     ]
@@ -247,13 +256,18 @@ def rewrite_query(state: State) -> State:
     out = rewrite_chain.invoke(
         {"question": state["question"], "today": date.today().isoformat()}
     )
-    return {"web_query": out.query}
+    return {"web_query": out.query, "web_time_range": out.time_range}
 
 def web_search(state: State) -> State:
     """Search the web and turn the results into Documents."""
+    
+    args = {"query": state.get("web_query") or state["question"]}
+    if state.get("web_time_range"):
+        args["time_range"] = state["web_time_range"]   # real date filter in Tavily
+
     try:
-        response = tavily.invoke({"query": state.get("web_query") or state["question"]})
-    except Exception as e:  # e.g. missing API key, network error
+        response = tavily.invoke(args)
+    except Exception as e:
         print(f"Web search failed: {e}")
         return {"web_docs": []}
 
@@ -415,7 +429,7 @@ for q in QUESTIONS:
     print("=" * 100)
 
     if res.get("web_query"):
-        print(f"WEB QUERY: {res['web_query']}")
+        print(f"WEB QUERY: {res['web_query']} (time_range={res.get('web_time_range')})")
     print("\nANSWER:\n", res["answer"])
     
 # print(res["answer"])
