@@ -340,6 +340,12 @@ g.add_edge("no_answer", END)
 
 app = g.compile()  # turn the definition into a runnable app
 
+# Save a diagram of the graph (needs internet: rendered via mermaid.ink)
+try:
+    Path("graph.png").write_bytes(app.get_graph().draw_mermaid_png())
+except Exception:
+    print(app.get_graph().draw_mermaid())   # offline fallback: Mermaid text
+    
 # 5) Run
 res = app.invoke({"question": "What is the capital of India?"})
 
