@@ -38,7 +38,7 @@ vector_store = FAISS.from_documents(chunks, embeddings)
 retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={'k':4})
 
 # 4) LLM + prompt
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
 
 class State(TypedDict):
     question: str
