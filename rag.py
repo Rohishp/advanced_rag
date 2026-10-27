@@ -75,7 +75,11 @@ index_folder(DOCS_DIR)
 
 
 
-retriever = vector_store.as_retriever(search_type='similarity', search_kwargs={'k':4})
+retriever = vector_store.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 4, "fetch_k": 20},
+)
+
 
 # 4) LLM + prompt
 llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
