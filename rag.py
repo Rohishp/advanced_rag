@@ -10,6 +10,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
+from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from dotenv import load_dotenv
 
@@ -84,10 +85,17 @@ retriever = vector_store.as_retriever(
 # 4) LLM + prompt
 llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
 
+class CitedAnswer(BaseModel):
+    answer: str = Field(description="Answer based only on the context.")
+    citations: list[int] = Field(description="Numbers of the context passages used.")
+
+structured_llm = llm.with_structured_output(CitedAnswer)
+
 class State(TypedDict):
     question: str
     docs: List[Document]
     answer: str
+    citations: List[int]
 
 
 def retrieve(state):
@@ -95,17 +103,25 @@ def retrieve(state):
     return {"docs": retriever.invoke(q)}
 
 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", "Answer only from the context. If not in context, say you don't know."),
-        ("human", "Question: {question}\n\nContext:\n{context}"),
-    ]
-)
+prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     "Answer only from the numbered context passages. "
+     "If the answer is not in the context, say you don't know. "
+     "Cite the passage numbers you used."),
+    ("human", "Question: {question}\n\nContext:\n{context}"),
+])
+
+def format_context(docs: list[Document]) -> str:
+    return "\n\n".join(
+        f"[{i}] ({d.metadata.get('source', '?')}, p.{d.metadata.get('page', '?')})\n{d.page_content}"
+        for i, d in enumerate(docs, 1)
+    )
 
 def generate(state):
-    context = "\n\n".join(d.page_content for d in state["docs"])
-    out = (prompt | llm).invoke({"question": state["question"], "context": context})
-    return {"answer": out.content}
+    out: CitedAnswer = (prompt | structured_llm).invoke(
+        {"question": state["question"], "context": format_context(state["docs"])}
+    )
+    return {"answer": out.answer, "citations": out.citations}
 
 
 g = StateGraph(State)
@@ -118,12 +134,9 @@ app = g.compile()
 
 # 5) Run
 res = app.invoke({"question": "WHat is a transformer in deep learning.", "docs": [], "answer": ""})
-print(res["answer"])
-
-print(res['docs'][0].page_content)
-print('*'*100)
-print(res['docs'][1].page_content)
-print('*'*100)
-print(res['docs'][2].page_content)
-print('*'*100)
-print(res['docs'][3].page_content)
+print(res["answer"], "\n")
+for n in res["citations"]:
+    d = res["docs"][n - 1]
+    print(f"[{n}] {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
+    print(d.page_content[:500])
+    print("*" * 100)
