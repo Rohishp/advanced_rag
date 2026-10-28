@@ -49,8 +49,9 @@ from rag_common import CorpusConfig, PdfIndex, chat_model
 
 load_dotenv()
 
-EVAL_MODEL = os.getenv("EVAL_MODEL", "gpt-5.4")   # judge; stronger than the pipeline's model
-EVAL_REASONING_EFFORT = os.getenv("EVAL_REASONING_EFFORT") or None
+# Judge: stronger than the pipeline's model. Defaults chosen in step 6 (decision S6.11).
+EVAL_MODEL = os.getenv("EVAL_MODEL", "gpt-6.1-sol")
+EVAL_REASONING_EFFORT = os.getenv("EVAL_REASONING_EFFORT", "low") or None
 RESULTS_DIR = Path("eval_results")
 METRICS = ["correctness", "faithfulness", "citations", "path_match", "llm_calls",
            "cost_per_1k", "latency_s"]
@@ -71,9 +72,17 @@ def load_cases(corpus_dir: Path) -> List[dict]:
     if len(ids) != len(set(ids)):
         sys.exit(f"{path}: duplicate case ids")
     for c in cases:
-        if c.get("expected_path") not in {"direct", "docs", "web", "no_answer"}:
+        if not c.get("expected_path") or not set(expected_paths(c["expected_path"])) <= PATHS:
             sys.exit(f"{path}: case {c['id']}: invalid expected_path {c.get('expected_path')!r}")
     return cases
+
+
+PATHS = {"direct", "docs", "web", "no_answer"}
+
+
+def expected_paths(value) -> List[str]:
+    """expected_path is one path or a list of accepted paths."""
+    return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
 def sync_dataset(client: Client, name: str, cases: List[dict]) -> None:
@@ -257,7 +266,7 @@ def correctness(inputs: dict, outputs: dict, reference_outputs: dict) -> dict:
                                                          "the information is not available)",
         "answer": outputs["answer"],
     })
-    if reference_outputs["expected_path"] == "no_answer":
+    if "no_answer" in expected_paths(reference_outputs["expected_path"]) and not facts:
         score = float(grade.declines and not grade.wrong_claims)
     elif grade.wrong_claims or not facts:
         score = 0.0 if grade.wrong_claims else 1.0
@@ -322,9 +331,9 @@ def citations(outputs: dict) -> dict:
 
 
 def path_match(outputs: dict, reference_outputs: dict) -> dict:
-    expected = reference_outputs["expected_path"]
-    return {"key": "path_match", "score": float(outputs["path"] == expected),
-            "comment": f"expected {expected}, got {outputs['path']}"}
+    expected = expected_paths(reference_outputs["expected_path"])
+    return {"key": "path_match", "score": float(outputs["path"] in expected),
+            "comment": f"expected {' or '.join(expected)}, got {outputs['path']}"}
 
 
 def llm_calls(outputs: dict) -> dict:

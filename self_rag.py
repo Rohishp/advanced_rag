@@ -48,8 +48,9 @@ load_dotenv()
 # Models are set in .env; the values here are only defaults.
 # EMBED_MODEL: an existing index was built with one model, so changing it needs a new db_dir.
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-mini")
-LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT") or None   # e.g. none, low, medium
+# Defaults chosen by the step 6 evals (decision S6.11); override in .env.
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-6-luna")
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "none") or None   # none, low, ...
 
 WEB_MAX_RESULTS = 5     # Tavily results for the web fallback
 

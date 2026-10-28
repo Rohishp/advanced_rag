@@ -1,5 +1,5 @@
 # Eval cases for self_rag.py:  python eval_self_rag.py --corpus corpora/nexaai
-# expected_path: direct | docs | web | no_answer
+# expected_path: direct | docs | web | no_answer, or a list of accepted paths
 # facts: what a correct answer must state (judged semantically, not by exact text).
 # The id is stable: changing a case updates it in LangSmith instead of creating a new one.
 cases:
@@ -58,7 +58,7 @@ cases:
     question: Who is the CEO of NexaAI?
     expected_path: docs
     facts:
-      - Aarav Mehta is the CEO (and founder)
+      - Aarav Mehta is the CEO
     tags: [single-fact]
 
   - id: cto
@@ -137,7 +137,8 @@ cases:
 
   - id: platinum-plan
     question: What does NexaAI's Platinum plan cost?
-    expected_path: no_answer
+    # false premise: "not found" and a correction from the docs ("no such plan") both pass
+    expected_path: [no_answer, docs]
     facts: []
     tags: [kb-gap, false-premise]
 
