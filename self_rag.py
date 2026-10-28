@@ -351,8 +351,11 @@ class SupportCheck(BaseModel):
         description="Up to 3 short verbatim quotes from the context that support the answer."
     )
     explanation: str = Field(
-        description="One or two sentences. Name any claim or wording not stated in the context."
+        description="One or two sentences naming any claim or wording not stated in the "
+                    "context. Never flag source labels or sentences saying the documents "
+                    "do not cover something."
     )
+    
     support: Literal["fully_supported", "partially_supported", "no_support"]
 
 
@@ -362,19 +365,19 @@ support_prompt = ChatPromptTemplate.from_messages(
             "system",
             "You verify whether an ANSWER is supported by the CONTEXT it was generated "
             "from. Use only the context, never outside knowledge.\n\n"
-            "- fully_supported: every claim is stated in the context. Close paraphrases "
-            "of stated facts are fine.\n"
+            "- fully_supported: every factual claim is stated in the context. Close "
+            "paraphrases are fine. Sentences saying the documents do not cover something "
+            "(e.g. 'the documents do not directly describe the culture') are honest "
+            "limitations, not claims, and count as supported. Source labels like "
+            "[file p.N] are not claims either.\n"
             "- partially_supported: the core facts are in the context, but the answer "
             "adds anything that is not: interpretive or qualitative words (e.g. "
             "'generous', 'emphasizes', 'strong', 'employee-first'), inferred causes or "
             "links (e.g. 'supports X through Y'), generalizations, or presenting policies "
             "as facts about culture.\n"
             "- no_support: the key claims are not in the context.\n\n"
-            "Be strict: a single unsupported word or link makes it partially_supported.\n"
-            "These are NOT claims and must never lower the verdict:\n"
-            "- source labels like [file p.N];\n"
-            "- statements about what the documents do not contain, e.g. 'the documents "
-            "do not describe the culture directly' or 'no refund policy is mentioned'.\n"
+            "Be strict about claims: a single unsupported word or link makes it "
+            "partially_supported.\n"
             "An answer that only says the information could not be found is "
             "fully_supported.",
         ),
