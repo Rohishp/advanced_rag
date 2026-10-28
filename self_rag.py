@@ -40,6 +40,7 @@ CHUNK_SIZE = 300        # tokens per chunk (short documents -> small chunks)
 CHUNK_OVERLAP = 50      # tokens shared between neighbouring chunks
 RETRIEVER_K = 4         # chunks returned per query
 MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
+MAX_REVISIONS = 2       # support-driven rewrites per answer
 INDEX_BATCH = 500       # max IDs per Chroma add/delete call
 
 RECURSION_LIMIT = 50    # max graph steps per question
@@ -182,6 +183,9 @@ class State(TypedDict, total=False):
     relevant_docs: List[Document]
     # generate
     context: str
+    support: Literal["fully_supported", "partially_supported", "no_support"]
+    evidence: List[str]
+    support_reason: str
 
 
 # 4) NODES (in execution order)
@@ -240,11 +244,6 @@ direct_prompt = ChatPromptTemplate.from_messages(
 def generate_direct(state: State) -> State:
     out = (direct_prompt | llm).invoke({"question": state["question"]})
     return {"answer": out.content}
-
-
-# ---------- Node: NO ANSWER ----------
-def no_answer(state: State) -> State:
-    return {"answer": NO_ANSWER, "context": ""}
 
 
 # ---------- Node: RETRIEVE ----------
@@ -332,6 +331,64 @@ def generate(state: State) -> State:
     return {"answer": out.content, "context": context}
 
 
+
+# ---------- Node: NO ANSWER ----------
+def no_answer(state: State) -> State:
+    return {"answer": NO_ANSWER, "context": ""}
+
+
+# ---------- Node: CHECK SUPPORT (IsSUP) ----------
+class SupportCheck(BaseModel):
+    # evidence and explanation come before the verdict so the model reasons first
+    evidence: List[str] = Field(
+        description="Up to 3 short verbatim quotes from the context that support the answer."
+    )
+    explanation: str = Field(
+        description="One or two sentences. Name any claim or wording not stated in the context."
+    )
+    support: Literal["fully_supported", "partially_supported", "no_support"]
+
+
+support_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You verify whether an ANSWER is supported by the CONTEXT it was generated "
+            "from. Use only the context, never outside knowledge.\n\n"
+            "- fully_supported: every claim is stated in the context. Close paraphrases "
+            "of stated facts are fine.\n"
+            "- partially_supported: the core facts are in the context, but the answer "
+            "adds anything that is not: interpretive or qualitative words (e.g. "
+            "'generous', 'emphasizes', 'strong', 'employee-first'), inferred causes or "
+            "links (e.g. 'supports X through Y'), generalizations, or presenting policies "
+            "as facts about culture.\n"
+            "- no_support: the key claims are not in the context.\n\n"
+            "Be strict: a single unsupported word or link makes it partially_supported.\n"
+            "Source labels like [file p.N] and statements about what information is "
+            "missing are not claims.\n"
+            "An answer that only says the information could not be found is "
+            "fully_supported.",
+        ),
+        ("human", "Question: {question}\n\nAnswer:\n{answer}\n\nContext:\n{context}"),
+    ]
+)
+support_chain = support_prompt | llm.with_structured_output(SupportCheck)
+
+
+def check_support(state: State) -> State:
+    if state["answer"].strip() == NO_ANSWER:  # nothing claimed, nothing to verify
+        return {"support": "fully_supported", "evidence": [],
+                "support_reason": "The answer states that the information was not found."}
+
+    out = support_chain.invoke(
+        {"question": state["question"], "answer": state["answer"],
+         "context": state["context"]}
+    )
+    return {"support": out.support, "evidence": out.evidence,
+            "support_reason": out.explanation}
+
+
+
 # ---------- Routing ----------
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
     return "retrieve" if state["need_retrieval"] else "generate_direct"
@@ -342,7 +399,8 @@ def route_after_grade(state: State) -> Literal["generate", "no_answer"]:
 # BUILD GRAPH
 def build_graph():
     """START -> decide_retrieval -> (generate_direct
-                                     | retrieve -> grade_documents -> (generate | no_answer)) -> END"""
+                                     | retrieve -> grade_documents
+                                       -> (generate -> check_support | no_answer)) -> END"""
     g = StateGraph(State)
     g.add_node("decide_retrieval", decide_retrieval)
     g.add_node("generate_direct", generate_direct)
@@ -350,6 +408,7 @@ def build_graph():
     g.add_node("grade_documents", grade_documents)
     g.add_node("generate", generate)
     g.add_node("no_answer", no_answer)
+    g.add_node("check_support", check_support)
 
     g.add_edge(START, "decide_retrieval")
     g.add_conditional_edges(
@@ -364,7 +423,8 @@ def build_graph():
         route_after_grade,
         {"generate": "generate", "no_answer": "no_answer"},
     )
-    g.add_edge("generate", END)
+    g.add_edge("generate", "check_support")
+    g.add_edge("check_support", END)
     g.add_edge("no_answer", END)
     return g.compile()
 
@@ -385,14 +445,11 @@ def print_result(res: State) -> None:
     print("QUESTION:", res["question"])
     print("NEED RETRIEVAL:", res.get("need_retrieval"))
 
-    if res.get("docs"):
-        relevant = res.get("relevant_docs", [])
-        print(f"\nRETRIEVED CHUNKS ({len(relevant)}/{len(res['docs'])} relevant):")
-        for d in res["docs"]:
-            mark = "keep" if d in relevant else "drop"
-            preview = d.page_content[:80].replace("\n", " ")
-            print(f"  [{mark}] {d.metadata.get('source', '?')} "
-                  f"p.{d.metadata.get('page', '?')}: {preview}")
+    if res.get("support"):
+        print(f"\nSUPPORT: {res['support']} (revisions: {res.get('revisions', 0)})")
+        print(f"  {res['support_reason']}")
+        for quote in res.get("evidence", []):
+            print(f'  > "{quote}"')
 
     print("\nANSWER:\n" + res.get("answer", "(none yet)"))
 
