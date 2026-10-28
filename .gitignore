@@ -5,3 +5,7 @@ __pycache__/
 documents/
 chroma_company/
 company_docs/
+
+# per-corpus data (configs in corpora/ are tracked)
+corpora/*/docs/
+corpora/*/index/

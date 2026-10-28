@@ -1,9 +1,22 @@
 """Self-RAG over a folder of PDFs, with a one-time web search fallback.
 
-Configure the corpus in the CONFIG block; the graph flow is documented in build_graph().
+Each corpus is a folder under corpora/ with its PDFs in docs/ and an optional corpus.yaml;
+the code holds no corpus knowledge.
+
+    python self_rag.py --corpus corpora/new init              # create docs/ + corpus.yaml
+    python self_rag.py --corpus corpora/nexaai index          # sync the vector store
+    python self_rag.py --corpus corpora/nexaai ask "question"
+    python self_rag.py --corpus corpora/nexaai demo           # run the config's test_questions
+    python self_rag.py --corpus corpora/nexaai graph          # save the graph diagram
+
+The graph flow is documented in build_graph().
 """
 
 # ---------- Standard library ----------
+import argparse
+import hashlib
+import json
+import sys
 from datetime import date
 from pathlib import Path
 from typing import List, Literal, Optional, TypedDict
@@ -15,12 +28,13 @@ from pydantic import BaseModel, Field
 # ---------- LangChain / LangGraph ----------
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableConfig
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, StateGraph
 
 # ---------- Local ----------
-from rag_common import CorpusConfig, PdfIndex
+from rag_common import CorpusConfig, PdfIndex, init_corpus, load_pdf
 
 load_dotenv()
 
@@ -28,24 +42,9 @@ load_dotenv()
 # ======================================================================
 # CONFIG
 # ======================================================================
-DOCS_DIR = Path("./company_docs")          # PDFs to index
-DB_DIR = Path("./chroma_company")          # Chroma storage
-COLLECTION = "company"
-
-# What the knowledge base contains; used by the prompts that need to know.
-KB_DESCRIPTION = (
-    "internal documents of the company NexaAI Solutions: HR and leave policies, "
-    "workplace conduct, the company profile and leadership team, and its products, "
-    "pricing plans and billing"
-)
-CHAR_REPLACEMENTS = {"■": "₹"}             # PDF extraction artifacts (wrong -> right)
-
 EMBED_MODEL = "text-embedding-3-large"
 LLM_MODEL = "gpt-5.4-mini"
 
-CHUNK_SIZE = 300        # tokens per chunk (short documents -> small chunks)
-CHUNK_OVERLAP = 50      # tokens shared between neighbouring chunks
-RETRIEVER_K = 4         # chunks returned per query
 WEB_MAX_RESULTS = 5     # Tavily results for the web fallback
 
 MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
@@ -55,33 +54,35 @@ RECURSION_LIMIT = 50    # max graph steps per question (worst case uses 41)
 
 NO_ANSWER = "I couldn't find this in the available sources."
 GRAPH_PNG = "self_rag_graph.png"
-
-TEST_QUESTIONS = [
-    "What is machine learning?",                                 # direct
-    "How many days of annual leave do employees get?",           # docs
-    "What does the Growth plan cost per user?",                  # docs (pricing)
-    "Who is the CEO of NexaAI?",                                 # docs
-    "Describe NexaAI's company culture.",                        # support strictness
-    "What is the refund policy of NexaAI?",                      # not in docs
-    "Who won the latest ICC Men's T20 World Cup match?",         # web fallback
-]
+KB_DESCRIPTION_FILE = "kb_description.json"   # cache in the corpus's db_dir
 
 
 # ======================================================================
 # CLIENTS
 # ======================================================================
-corpus = CorpusConfig(
-    docs_dir=DOCS_DIR,
-    db_dir=DB_DIR,
-    collection=COLLECTION,
-    chunk_size=CHUNK_SIZE,
-    chunk_overlap=CHUNK_OVERLAP,
-    char_replacements=CHAR_REPLACEMENTS,
-)
-index = PdfIndex(corpus, OpenAIEmbeddings(model=EMBED_MODEL))
-retriever = index.store.as_retriever(search_kwargs={"k": RETRIEVER_K})
+embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
 llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
 tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general", search_depth="advanced")
+
+
+# ======================================================================
+# CORPUS CONTEXT (passed per invoke, so one compiled graph serves any corpus)
+# ======================================================================
+def corpus_context(config: RunnableConfig) -> dict:
+    """The retriever and kb_description set in run_config()."""
+    return config["configurable"]
+
+
+def run_config(index: PdfIndex, kb_description: str) -> RunnableConfig:
+    return {
+        "recursion_limit": RECURSION_LIMIT,
+        "configurable": {
+            "kb_description": kb_description,
+            "retriever": index.store.as_retriever(
+                search_kwargs={"k": index.cfg.retriever_k}
+            ),
+        },
+    }
 
 
 # ======================================================================
@@ -140,11 +141,14 @@ decide_retrieval_chain = ChatPromptTemplate.from_messages(
         ),
         ("human", "Question: {question}"),
     ]
-).partial(kb_description=KB_DESCRIPTION) | llm.with_structured_output(RetrieveDecision)
+) | llm.with_structured_output(RetrieveDecision)
 
 
-def decide_retrieval(state: State) -> State:
-    decision = decide_retrieval_chain.invoke({"question": state["question"]})
+def decide_retrieval(state: State, config: RunnableConfig) -> State:
+    decision = decide_retrieval_chain.invoke(
+        {"question": state["question"],
+         "kb_description": corpus_context(config)["kb_description"]}
+    )
     return {"need_retrieval": decision.should_retrieve}
 
 
@@ -166,8 +170,9 @@ def generate_direct(state: State) -> State:
 
 
 # ---------- Node: RETRIEVE ----------
-def retrieve(state: State) -> State:
+def retrieve(state: State, config: RunnableConfig) -> State:
     # the rewritten query is only a search key; graders always use the original question
+    retriever = corpus_context(config)["retriever"]
     return {"docs": retriever.invoke(state.get("retrieval_query") or state["question"])}
 
 
@@ -230,12 +235,15 @@ generate_chain = ChatPromptTemplate.from_messages(
         ),
         ("human", "Question: {question}\n\nContext:\n{context}"),
     ]
-).partial(kb_description=KB_DESCRIPTION, no_answer=NO_ANSWER) | llm
+).partial(no_answer=NO_ANSWER) | llm
 
 
-def generate(state: State) -> State:
+def generate(state: State, config: RunnableConfig) -> State:
     context = format_context(state.get("relevant_docs", []))
-    answer = generate_chain.invoke({"question": state["question"], "context": context})
+    answer = generate_chain.invoke(
+        {"question": state["question"], "context": context,
+         "kb_description": corpus_context(config)["kb_description"]}
+    )
     return {"answer": answer.content, "context": context}
 
 
@@ -363,13 +371,14 @@ rewrite_chain = ChatPromptTemplate.from_messages(
         ),
         ("human", "Question: {question}\n\nPrevious query: {previous}"),
     ]
-).partial(kb_description=KB_DESCRIPTION) | llm.with_structured_output(RetrievalQuery)
+) | llm.with_structured_output(RetrievalQuery)
 
 
-def rewrite_question(state: State) -> State:
+def rewrite_question(state: State, config: RunnableConfig) -> State:
     out = rewrite_chain.invoke(
         {"question": state["question"],
-         "previous": state.get("retrieval_query") or state["question"]}
+         "previous": state.get("retrieval_query") or state["question"],
+         "kb_description": corpus_context(config)["kb_description"]}
     )
     return {"retrieval_query": out.query, "rewrites": state.get("rewrites", 0) + 1,
             **fresh_pass()}
@@ -553,12 +562,121 @@ def print_result(res: State) -> None:
     print("\nANSWER:\n" + res.get("answer", "(none)"))
 
 
-def main() -> None:
-    index.sync()
+# ======================================================================
+# KB DESCRIPTION (from the config, or generated once per index state)
+# ======================================================================
+class KbDescription(BaseModel):
+    description: str = Field(
+        description="A noun phrase completing 'The knowledge base contains ...', "
+                    "naming the organizations or subjects and the main topics."
+    )
+
+
+kb_description_chain = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You describe a document collection for a retrieval system. From the file "
+            "names and opening pages, write one noun phrase (under 60 words) that "
+            "completes 'The knowledge base contains ...'. Name the organizations, "
+            "products or subjects and list the main topics. Do not invent topics.",
+        ),
+        ("human", "{samples}"),
+    ]
+) | llm.with_structured_output(KbDescription)
+
+
+def _kb_cache(index: PdfIndex) -> Path:
+    return index.cfg.db_dir / KB_DESCRIPTION_FILE
+
+
+def _index_state(index: PdfIndex) -> str:
+    """Hash of all PDF fingerprints: the cached description is valid while it matches."""
+    state = json.dumps(index.fingerprints(), sort_keys=True)
+    return hashlib.sha256(state.encode()).hexdigest()
+
+
+def generate_kb_description(index: PdfIndex, chars_per_pdf: int = 1500,
+                            max_pdfs: int = 20) -> str:
+    """Summarise the first page of each PDF (bounded cost) into a KB description."""
+    samples = []
+    for pdf in sorted(index.cfg.docs_dir.glob("*.pdf"))[:max_pdfs]:
+        pages = load_pdf(pdf, index.cfg.text_fixes)
+        if pages:
+            samples.append(f"## {pdf.name}\n{pages[0].page_content[:chars_per_pdf]}")
+    if not samples:
+        raise ValueError(f"No readable PDFs in {index.cfg.docs_dir}")
+    return kb_description_chain.invoke({"samples": "\n\n".join(samples)}).description
+
+
+def refresh_kb_description(index: PdfIndex) -> None:
+    """After indexing: regenerate the cached description if the corpus changed."""
+    if index.cfg.kb_description:
+        return
+    cache, state = _kb_cache(index), _index_state(index)
+    if cache.exists() and json.loads(cache.read_text(encoding="utf-8")).get("index_state") == state:
+        return
+    description = generate_kb_description(index)
+    cache.write_text(json.dumps({"index_state": state, "description": description},
+                                indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Generated KB description: {description}")
+
+
+def kb_description_for(index: PdfIndex) -> str:
+    """The configured description, else the cached one; never generated at question time."""
+    if index.cfg.kb_description:
+        return index.cfg.kb_description
+    cache = _kb_cache(index)
+    if cache.exists():
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+        if cached.get("index_state") == _index_state(index):
+            return cached["description"]
+    sys.exit(f"No KB description for corpus '{index.cfg.name}': run the index command first.")
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Self-RAG over a folder of PDFs.")
+    parser.add_argument("--corpus", required=True,
+                        help="corpus folder (corpus.yaml optional), or the YAML file itself")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("init", help="create the corpus folder with docs/ and a commented corpus.yaml")
+    sub.add_parser("index", help="index new or changed PDFs, drop removed ones")
+    ask = sub.add_parser("ask", help="answer one question")
+    ask.add_argument("question")
+    sub.add_parser("demo", help="answer the config's test_questions")
+    sub.add_parser("graph", help=f"save the graph diagram to {GRAPH_PNG}")
+    return parser.parse_args(argv)
+
+
+def main(argv=None) -> None:
+    args = parse_args(argv)
+    if args.command == "init":
+        config = init_corpus(args.corpus)
+        print(f"Created {config} and {config.parent / 'docs'}: add PDFs, then run index.")
+        return
+    if args.command == "graph":
+        save_graph_diagram(build_graph())
+        return
+
+    index = PdfIndex(CorpusConfig.load(args.corpus), embeddings)
+    if args.command == "index":
+        index.sync()
+        refresh_kb_description(index)
+        return
+
+    if index.count() == 0:
+        sys.exit(f"Corpus '{index.cfg.name}' is not indexed: run the index command first.")
+    questions = [args.question] if args.command == "ask" else list(index.cfg.test_questions)
+    if not questions:
+        sys.exit(f"Corpus '{index.cfg.name}' has no test_questions.")
+
     app = build_graph()
-    save_graph_diagram(app)
-    for q in TEST_QUESTIONS:
-        print_result(app.invoke({"question": q}, config={"recursion_limit": RECURSION_LIMIT}))
+    config = run_config(index, kb_description_for(index))
+    for q in questions:
+        print_result(app.invoke({"question": q}, config=config))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,32 @@
+# Corpus config for self_rag.py. Relative paths are resolved against this folder.
+name: nexaai
+docs_dir: ../../company_docs     # PDFs to index
+db_dir: ../../chroma_company     # Chroma storage + manifest
+collection: company
+
+# What the knowledge base contains; completes "The knowledge base contains ...".
+# Leave it out to have it generated from the PDFs at index time.
+kb_description: >-
+  internal documents of the company NexaAI Solutions: HR and leave policies,
+  workplace conduct, the company profile and leadership team, and its products,
+  pricing plans and billing
+
+# Regex fixes for PDF extraction artifacts, applied in order before chunking.
+text_fixes:
+  - pattern: '(?<![A-Za-z0-9])I(?=\d)'   # pymupdf4llm extracts the rupee sign as "I"
+    replacement: '₹'
+
+chunking:
+  size: 300       # tokens per chunk (short documents -> small chunks)
+  overlap: 50     # tokens shared between neighbouring chunks
+
+retriever_k: 4
+
+test_questions:
+  - What is machine learning?                            # direct
+  - How many days of annual leave do employees get?      # docs
+  - What does the Growth plan cost per user?             # docs (pricing)
+  - Who is the CEO of NexaAI?                            # docs
+  - Describe NexaAI's company culture.                   # support strictness
+  - What is the refund policy of NexaAI?                 # not in docs
+  - Who won the latest ICC Men's T20 World Cup match?    # web fallback
