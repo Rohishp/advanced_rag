@@ -328,10 +328,13 @@ def print_result(res: State) -> None:
     print("NEED RETRIEVAL:", res.get("need_retrieval"))
 
     if res.get("docs"):
-        print("\nRETRIEVED CHUNKS:")
+        relevant = res.get("relevant_docs", [])
+        print(f"\nRETRIEVED CHUNKS ({len(relevant)}/{len(res['docs'])} relevant):")
         for d in res["docs"]:
+            mark = "keep" if d in relevant else "drop"
             preview = d.page_content[:80].replace("\n", " ")
-            print(f"  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {preview}")
+            print(f"  [{mark}] {d.metadata.get('source', '?')} "
+                  f"p.{d.metadata.get('page', '?')}: {preview}")
 
     print("\nANSWER:\n" + res.get("answer", "(none yet)"))
 
