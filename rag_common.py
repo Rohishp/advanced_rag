@@ -2,21 +2,78 @@
 
 import hashlib
 import json
+import logging
+import os
+import random
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 import pymupdf4llm
 import yaml
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+log = logging.getLogger(__name__)
 
 INDEX_BATCH = 500  # max IDs per Chroma add/delete call
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+# ======================================================================
+# API SETTINGS (timeouts and retries; .env overrides the defaults)
+# ======================================================================
+# Read when a client is built, not at import, so a later load_dotenv() still applies.
+API_DEFAULTS = {
+    "LLM_TIMEOUT_S": 120.0,     # per LLM request (chat models, incl. the eval judge)
+    "EMBED_TIMEOUT_S": 60.0,    # per embedding request
+    "WEB_TIMEOUT_S": 60.0,      # per web search request (Tavily caps it at 120)
+    "API_MAX_RETRIES": 3,       # retries after a failed request, for every API
+}
+
+
+def api_setting(name: str):
+    """A timeout (> 0 seconds) or retry count (>= 0) from .env, else its default."""
+    default = API_DEFAULTS[name]
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = type(default)(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r}: expected a {type(default).__name__}") from None
+    if value < 0 or (value == 0 and isinstance(value, float)):
+        raise ValueError(f"{name}={raw!r}: out of range")
+    return value
+
+
+T = TypeVar("T")
+
+
+def call_with_retries(fn: Callable[[], T], retryable: Callable[[Exception], bool],
+                      what: str, retries: Optional[int] = None) -> T:
+    """fn() with exponential backoff and jitter for errors that retryable() accepts.
+
+    Delays follow the OpenAI SDK's (0.5 s doubling, capped at 8 s). For clients without
+    built-in retries; the OpenAI clients retry on their own (max_retries).
+    """
+    retries = api_setting("API_MAX_RETRIES") if retries is None else retries
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == retries or not retryable(e):
+                raise
+            delay = min(8.0, 0.5 * 2 ** attempt) * random.uniform(0.5, 1.0)
+            log.warning("%s failed (%r); retry %d/%d in %.1f s",
+                        what, e, attempt + 1, retries, delay)
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def chat_model(model: str, reasoning_effort: Optional[str] = None) -> ChatOpenAI:
@@ -25,14 +82,24 @@ def chat_model(model: str, reasoning_effort: Optional[str] = None) -> ChatOpenAI
     No effort set: temperature 0 (models without reasoning settings).
     'none': no reasoning, temperature 0.
     Any other effort: no temperature; reasoning models reject it unless effort is 'none'.
+    Timeout and retries: LLM_TIMEOUT_S, API_MAX_RETRIES. The OpenAI SDK retries connection
+    errors, timeouts, 408/409/429 and 5xx with backoff; a retry is not a new LLM call.
     """
     if reasoning_effort and reasoning_effort not in REASONING_EFFORTS:
         raise ValueError(f"Unknown reasoning effort {reasoning_effort!r}; "
                          f"expected one of {sorted(REASONING_EFFORTS)}")
+    limits = {"timeout": api_setting("LLM_TIMEOUT_S"),
+              "max_retries": api_setting("API_MAX_RETRIES")}
     if reasoning_effort and reasoning_effort != "none":
-        return ChatOpenAI(model=model, reasoning_effort=reasoning_effort)
+        return ChatOpenAI(model=model, reasoning_effort=reasoning_effort, **limits)
     extra = {"reasoning_effort": "none"} if reasoning_effort == "none" else {}
-    return ChatOpenAI(model=model, temperature=0, **extra)
+    return ChatOpenAI(model=model, temperature=0, **extra, **limits)
+
+
+def embedding_model(model: str) -> OpenAIEmbeddings:
+    """OpenAIEmbeddings with EMBED_TIMEOUT_S and API_MAX_RETRIES (SDK retries, as above)."""
+    return OpenAIEmbeddings(model=model, timeout=api_setting("EMBED_TIMEOUT_S"),
+                            max_retries=api_setting("API_MAX_RETRIES"))
 
 
 TextFix = Tuple[str, str]  # (regex pattern, replacement)

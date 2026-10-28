@@ -33,12 +33,16 @@ from pydantic import BaseModel, Field
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
-from langchain_openai import OpenAIEmbeddings
-from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, StateGraph
 
+# ---------- Web search ----------
+import requests
+from tavily import TavilyClient
+from tavily.errors import TimeoutError as TavilyTimeout, UsageLimitExceededError
+
 # ---------- Local ----------
-from rag_common import CorpusConfig, PdfIndex, chat_model, init_corpus, load_pdf
+from rag_common import (CorpusConfig, PdfIndex, api_setting, call_with_retries, chat_model,
+                        embedding_model, init_corpus, load_pdf)
 
 load_dotenv()
 
@@ -68,9 +72,39 @@ KB_DESCRIPTION_FILE = "kb_description.json"   # cache in the corpus's db_dir
 # ======================================================================
 # CLIENTS
 # ======================================================================
-embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
+# Timeouts and retries: LLM_TIMEOUT_S, EMBED_TIMEOUT_S, WEB_TIMEOUT_S, API_MAX_RETRIES
+# (.env, defaults in rag_common.API_DEFAULTS).
+embeddings = embedding_model(EMBED_MODEL)
 llm = chat_model(LLM_MODEL, LLM_REASONING_EFFORT)
-tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general", search_depth="advanced")
+
+
+def web_retryable(e: Exception) -> bool:
+    """Rate limit (429), timeouts, connection errors and server errors (5xx).
+
+    Not retried: bad request (400), invalid key (401), forbidden or plan limits (403, 432,
+    433), as Tavily advises (help.tavily.com, 'Understanding HTTP errors').
+    """
+    if isinstance(e, (UsageLimitExceededError, TavilyTimeout,
+                      requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(e, requests.HTTPError):
+        return e.response is not None and e.response.status_code >= 500
+    return False
+
+
+def search_web(query: str, time_range: Optional[str] = None) -> dict:
+    """One Tavily search with WEB_TIMEOUT_S per request, retried with backoff."""
+    key = os.getenv("TAVILY_API_KEY")
+    if not key:   # never fall back to Tavily's keyless mode
+        raise RuntimeError("TAVILY_API_KEY is not set")
+
+    def once() -> dict:
+        with TavilyClient(api_key=key) as client:   # one session per call: thread-safe
+            return client.search(query, search_depth="advanced", topic="general",
+                                 max_results=WEB_MAX_RESULTS, time_range=time_range,
+                                 timeout=api_setting("WEB_TIMEOUT_S"))
+
+    return call_with_retries(once, web_retryable, "Web search")
 
 
 # ======================================================================
@@ -533,12 +567,9 @@ def rewrite_web_query(state: State) -> State:
 # ---------- Node: WEB SEARCH (at most once per question) ----------
 def web_search(state: State) -> State:
     """Page text goes into page_content; title and URL into metadata."""
-    args = {"query": state["web_query"]}
-    if state.get("web_time_range"):
-        args["time_range"] = state["web_time_range"]
     try:
-        response = tavily.invoke(args)
-    except Exception as e:  # missing API key, network error, ...
+        response = search_web(state["web_query"], state.get("web_time_range"))
+    except Exception as e:  # missing API key, retries used up, ...
         print(f"Web search failed: {e}")
         response = {}
 
