@@ -14,10 +14,12 @@ The graph flow is documented in build_graph().
 
 # ---------- Standard library ----------
 import argparse
+import contextvars
 import hashlib
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from typing import List, Literal, Optional, TypedDict
@@ -48,7 +50,7 @@ LLM_MODEL = "gpt-5.4-mini"
 
 WEB_MAX_RESULTS = 5     # Tavily results for the web fallback
 
-MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
+MAX_CONCURRENCY = 10    # parallel LLM calls when grading chunks
 MAX_REVISIONS = 2       # support-driven rewrites per answer
 MAX_REWRITES = 2        # retrieval retries with a rewritten query
 RECURSION_LIMIT = 50    # max graph steps per question (worst case uses 41)
@@ -98,6 +100,20 @@ def run_config(index: PdfIndex, kb_description: str) -> RunnableConfig:
             ),
         },
     }
+
+
+def invoke_parallel(chain, inputs: List[dict], config: RunnableConfig) -> list:
+    """chain.invoke over all inputs in parallel threads, traced as children of the node.
+
+    Used instead of chain.batch(): under LangSmith evaluate(), batch() loses track of its
+    runs (TracerException 'No indexed run ID'); plain invokes with the node's config do not.
+    """
+    if not inputs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENCY, len(inputs))) as pool:
+        futures = [pool.submit(contextvars.copy_context().run, chain.invoke, x, config)
+                   for x in inputs]
+        return [f.result() for f in futures]
 
 
 # ======================================================================
@@ -234,10 +250,11 @@ def grade_documents(state: State, config: RunnableConfig) -> State:
     """Grade all chunks in parallel; keep those about the right entity and topic."""
     docs = state.get("docs", [])
     kb_description = corpus_context(config)["kb_description"]
-    grades = relevance_chain.batch(
+    grades = invoke_parallel(
+        relevance_chain,
         [{"question": state["question"], "source": source_label(d), "chunk": d.page_content,
           "kb_description": kb_description} for d in docs],
-        config={"max_concurrency": MAX_CONCURRENCY},
+        config,
     )
     return {"relevant_docs": [d for d, g in zip(docs, grades)
                               if g.same_entity and g.on_topic]}
