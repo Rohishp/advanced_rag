@@ -43,6 +43,7 @@ MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
 INDEX_BATCH = 500       # max IDs per Chroma add/delete call
 
 RECURSION_LIMIT = 50    # max graph steps per question
+NO_ANSWER = "I couldn't find this in the company documents."
 GRAPH_PNG = "self_rag_graph.png"
 
 TEST_QUESTIONS = [
@@ -179,6 +180,8 @@ class State(TypedDict, total=False):
     answer: str
     # grade_documents
     relevant_docs: List[Document]
+    # generate
+    context: str
 
 
 # 4) NODES (in execution order)
@@ -285,6 +288,45 @@ def grade_documents(state: State) -> State:
     )
     return {"relevant_docs": [d for d, g in zip(docs, grades) if g.is_relevant]}
 
+# ---------- Node: GENERATE from relevant chunks ----------
+def format_context(docs: List[Document]) -> str:
+    """Label each chunk with its source so the answer can cite it."""
+    return "\n\n---\n\n".join(
+        f"[{d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}]\n{d.page_content}"
+        for d in docs
+    )
+
+
+rag_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You answer questions about the company NexaAI Solutions using ONLY the "
+            "context below, which comes from internal company documents.\n\n"
+            "Rules:\n"
+            "- Do not use outside knowledge and do not add facts, opinions or "
+            "interpretations that are not stated in the context.\n"
+            "- Cite the source label of every fact you use, e.g. [Company_Policies.pdf p.1].\n"
+            "- If the context only partly answers the question, answer that part and "
+            "say what is missing.\n"
+            "- If the context does not answer the question at all, reply exactly: "
+            "\"{no_answer}\"\n"
+            "- Do not mention 'the context' in your answer.\n"
+            "- The symbol ■ stands for the Indian rupee sign (₹).",
+        ),
+        ("human", "Question: {question}\n\nContext:\n{context}"),
+    ]
+)
+
+
+def generate(state: State) -> State:
+    context = format_context(state.get("relevant_docs", []))
+    out = (rag_prompt | llm).invoke(
+        {"question": state["question"], "context": context, "no_answer": NO_ANSWER}
+    )
+    return {"answer": out.content, "context": context}
+
+
 # ---------- Routing ----------
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
     return "retrieve" if state["need_retrieval"] else "generate_direct"
@@ -292,12 +334,14 @@ def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
 
 # BUILD GRAPH
 def build_graph():
-    """START -> decide_retrieval -> (generate_direct | retrieve -> grade_documents) -> END"""
+    """START -> decide_retrieval -> (generate_direct
+                                     | retrieve -> grade_documents -> generate) -> END"""
     g = StateGraph(State)
     g.add_node("decide_retrieval", decide_retrieval)
     g.add_node("generate_direct", generate_direct)
     g.add_node("retrieve", retrieve)
     g.add_node("grade_documents", grade_documents)
+    g.add_node("generate", generate)
 
     g.add_edge(START, "decide_retrieval")
     g.add_conditional_edges(
@@ -307,7 +351,8 @@ def build_graph():
     )
     g.add_edge("generate_direct", END)
     g.add_edge("retrieve", "grade_documents")
-    g.add_edge("grade_documents", END)  # temporary end of the retrieval path
+    g.add_edge("grade_documents", "generate")
+    g.add_edge("generate", END)
     return g.compile()
 
 
