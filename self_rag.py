@@ -1,8 +1,6 @@
-"""Self-RAG over company PDFs (NexaAI Solutions), with web search fallback.
+"""Self-RAG over company PDFs, with web search fallback.
 
-Built step by step.
-Step 1: configuration, PDF loading and persistent indexing.
-Step 2: retrieval decision -> (generate_direct | retrieve).
+The graph flow is documented in build_graph().
 """
 
 # ---------- Standard library ----------
