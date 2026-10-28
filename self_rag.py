@@ -416,6 +416,8 @@ support_prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+support_chain = support_prompt | llm.with_structured_output(SupportCheck)
+
 def normalize(text: str) -> str:
     """Lower-case and straighten curly apostrophes for robust comparisons."""
     return text.strip().replace("\u2019", "'").lower()
@@ -429,10 +431,8 @@ def check_support(state: State) -> State:
         return {"support": "fully_supported", "evidence": [],
                 "support_reason": "The answer states that the information was not found."}
 
-    out = support_chain.invoke(
-        {"question": state["question"], "answer": state["answer"],
-         "context": state["context"]}
-    )
+    out = support_chain.invoke({"answer": state["answer"], "context": state["context"]})
+    
     return {"support": out.support, "evidence": out.evidence,
             "support_reason": out.explanation}
 
