@@ -36,6 +36,7 @@ def chat_model(model: str, reasoning_effort: Optional[str] = None) -> ChatOpenAI
 
 
 TextFix = Tuple[str, str]  # (regex pattern, replacement)
+CHUNK_MODES = {"sections", "pages"}
 CONFIG_NAME = "corpus.yaml"
 
 CONFIG_TEMPLATE = """\
@@ -58,7 +59,8 @@ CONFIG_TEMPLATE = """\
 #     replacement: '\u20b9'
 
 # chunking:
-#   size: 300                 # tokens per chunk
+#   mode: sections            # sections: split at Markdown headings first; pages: old behaviour
+#   size: 300                 # tokens per chunk (longer sections are split further)
 #   overlap: 50               # tokens shared between neighbouring chunks
 
 # retriever_k: 4              # chunks returned per query
@@ -76,6 +78,7 @@ class CorpusConfig:
     docs_dir: Path
     db_dir: Path
     collection: str
+    chunk_mode: str = "sections"            # "sections" (headings first) or "pages"
     chunk_size: int = 300                   # tokens per chunk
     chunk_overlap: int = 50                 # tokens shared between neighbouring chunks
     text_fixes: Tuple[TextFix, ...] = ()    # regex fixes for PDF extraction artifacts
@@ -116,6 +119,9 @@ class CorpusConfig:
             fixes.append((fix["pattern"], fix["replacement"]))
 
         chunking = raw.get("chunking") or {}
+        mode = chunking.get("mode", cls.chunk_mode)
+        if mode not in CHUNK_MODES:
+            raise ValueError(f"{path}: chunking.mode must be one of {sorted(CHUNK_MODES)}")
         name = raw.get("name") or base.resolve().name
         description = (raw.get("kb_description") or "").strip() or None
         return cls(
@@ -123,6 +129,7 @@ class CorpusConfig:
             docs_dir=(base / raw.get("docs_dir", "docs")).resolve(),
             db_dir=(base / raw.get("db_dir", "index")).resolve(),
             collection=raw.get("collection", name),
+            chunk_mode=mode,
             chunk_size=int(chunking.get("size", cls.chunk_size)),
             chunk_overlap=int(chunking.get("overlap", cls.chunk_overlap)),
             text_fixes=tuple(fixes),
@@ -168,6 +175,72 @@ def chunk_id(doc: Document) -> str:
 
 
 # ======================================================================
+# SPLIT (Markdown sections first, then tokens within long sections)
+# ======================================================================
+HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+
+def heading_title(raw: str) -> str:
+    """'## **Core Values**' -> 'Core Values'."""
+    return re.sub(r"[*_`]+", "", raw).strip()
+
+
+def split_sections(pages: List[Document]) -> List[Document]:
+    """One Document per Markdown section of a PDF; sections may span pages.
+
+    metadata: source, page (where the section starts), section (heading path,
+    ' > '-joined), and page_offsets (char offset -> page, for later sub-splits).
+    Text before the first heading becomes a section with an empty path.
+    """
+    sections: List[Document] = []
+    path: List[Tuple[int, str]] = []          # (level, title) of the open headings
+    lines: List[str] = []
+    offsets: List[Tuple[int, int]] = []       # (char offset in section text, page)
+    source = pages[0].metadata["source"] if pages else ""
+
+    def close():
+        text = "\n".join(lines).strip()
+        body = "\n".join(l for l in lines if not HEADING.match(l)).strip()
+        if body:                              # skip heading-only sections
+            sections.append(Document(page_content=text, metadata={
+                "source": source, "page": offsets[0][1],
+                "section": " > ".join(t for _, t in path),
+                "page_offsets": list(offsets)}))
+
+    for doc in pages:
+        page = doc.metadata["page"]
+        for line in doc.page_content.splitlines():
+            m = HEADING.match(line)
+            if m:
+                close()
+                level = len(m.group(1))
+                path = [(l, t) for l, t in path if l < level] + [(level, heading_title(m.group(2)))]
+                lines, offsets = [], []
+            if not offsets or offsets[-1][1] != page:
+                offsets.append((len("\n".join(lines)) + (1 if lines else 0), page))
+            lines.append(line)
+    close()
+    return sections
+
+
+def chunk_sections(sections: List[Document], splitter) -> List[Document]:
+    """Split long sections by tokens; prefix each chunk with its heading path."""
+    chunks: List[Document] = []
+    for sec in sections:
+        meta = {k: v for k, v in sec.metadata.items() if k != "page_offsets"}
+        parts = splitter.create_documents([sec.page_content])
+        for n, part in enumerate(parts, 1):
+            start = part.metadata.get("start_index", 0)
+            page = [pg for off, pg in sec.metadata["page_offsets"] if off <= max(start, 0)][-1]
+            prefix = f"Section: {meta['section']}\n\n" if meta["section"] else ""
+            chunks.append(Document(
+                page_content=prefix + part.page_content,
+                metadata={**meta, "page": page, "part": n if len(parts) > 1 else 0},
+            ))
+    return chunks
+
+
+# ======================================================================
 # INDEX
 # ======================================================================
 class PdfIndex:
@@ -176,7 +249,7 @@ class PdfIndex:
     def __init__(self, cfg: CorpusConfig, embeddings: Embeddings):
         self.cfg = cfg
         self.splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-            chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap
+            chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap, add_start_index=True
         )
         self.store = Chroma(
             collection_name=cfg.collection,
@@ -187,11 +260,19 @@ class PdfIndex:
     def fingerprint(self, path: Path) -> str:
         """Hash of the PDF plus the settings that shape its chunks (changing them re-indexes)."""
         settings = json.dumps(
-            {"chunk_size": self.cfg.chunk_size, "chunk_overlap": self.cfg.chunk_overlap,
+            {"chunk_mode": self.cfg.chunk_mode,
+             "chunk_size": self.cfg.chunk_size, "chunk_overlap": self.cfg.chunk_overlap,
              "text_fixes": [list(f) for f in self.cfg.text_fixes]},
             sort_keys=True, ensure_ascii=False,
         )
         return hashlib.sha256(path.read_bytes() + settings.encode()).hexdigest()
+
+    def chunk(self, pages: List[Document]) -> List[Document]:
+        if self.cfg.chunk_mode == "pages":
+            return [Document(page_content=d.page_content,
+                             metadata={k: v for k, v in d.metadata.items() if k != "start_index"})
+                    for d in self.splitter.split_documents(pages)]
+        return chunk_sections(split_sections(pages), self.splitter)
 
     def source_ids(self, source: str) -> List[str]:
         return self.store.get(where={"source": source}, include=[])["ids"]
@@ -239,7 +320,7 @@ class PdfIndex:
                 print(f"{pdf.name}: unchanged, skipped")
                 continue
 
-            chunks = self.splitter.split_documents(load_pdf(pdf, self.cfg.text_fixes))
+            chunks = self.chunk(load_pdf(pdf, self.cfg.text_fixes))
 
             # De-duplicate identical chunks (Chroma raises DuplicateIDError otherwise)
             unique: Dict[str, Document] = {}

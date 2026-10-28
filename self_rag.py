@@ -272,10 +272,16 @@ def grade_documents(state: State, config: RunnableConfig) -> State:
 
 # ---------- Node: GENERATE from relevant chunks ----------
 def source_label(doc: Document) -> str:
-    """'file p.N' for PDF chunks, 'web: title (url)' for web results."""
-    if doc.metadata.get("url"):
-        return f"web: {doc.metadata.get('source', '?')} ({doc.metadata['url']})"
-    return f"{doc.metadata.get('source', '?')} p.{doc.metadata.get('page', '?')}"
+    """'file p.N, Section (part k)' for PDF chunks, 'web: title (url)' for web results."""
+    meta = doc.metadata
+    if meta.get("url"):
+        return f"web: {meta.get('source', '?')} ({meta['url']})"
+    label = f"{meta.get('source', '?')} p.{meta.get('page', '?')}"
+    if meta.get("section"):
+        label += f", {meta['section'].split(' > ')[-1]}"
+    if meta.get("part"):
+        label += f" (part {meta['part']})"
+    return label
 
 
 def format_context(docs: List[Document]) -> str:
