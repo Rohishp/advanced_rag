@@ -149,3 +149,32 @@ cases:
     facts:
       - India won the 2026 ICC Men's T20 World Cup
     tags: [web]
+
+  # Added 28 Oct (Step 11, approved by Rohish): more web cases, so web-path changes are judged
+  # on more than t20. Fixed 2026 events (not answerable from model knowledge, no drift);
+  # multi-part questions, so a refined source must keep every part. Facts checked against
+  # two sources each.
+  - id: worldcup-2026-final
+    question: Who won the 2026 FIFA World Cup final, against whom, and who scored the winning goal?
+    expected_path: web
+    facts:
+      - Spain won the 2026 FIFA World Cup final
+      - Spain beat Argentina 1-0
+      - Ferran Torres scored the winning goal
+    tags: [web, multi-part]
+
+  - id: nobel-physics-2026
+    question: Who won the 2026 Nobel Prize in Physics, and for what?
+    expected_path: web
+    facts:
+      - Francis Halzen won the 2026 Nobel Prize in Physics
+      - For work on the IceCube Neutrino Observatory and the discovery of high-energy astrophysical neutrinos
+    tags: [web, multi-part]
+
+  - id: wimbledon-2026-mens
+    question: Who won the men's singles title at Wimbledon 2026, and whom did he beat in the final?
+    expected_path: web
+    facts:
+      - Jannik Sinner won the 2026 Wimbledon men's singles title
+      - He beat Alexander Zverev in the final
+    tags: [web, multi-part]
