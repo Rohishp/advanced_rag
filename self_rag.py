@@ -43,7 +43,7 @@ MAX_REWRITES = 2        # retrieval retries with a rewritten query
 INDEX_BATCH = 500       # max IDs per Chroma add/delete call
 
 RECURSION_LIMIT = 50    # max graph steps per question
-NO_ANSWER = "I couldn't find this in the company documents."
+NO_ANSWER = "I couldn't find this in the available sources."
 GRAPH_PNG = "self_rag_graph.png"
 
 TEST_QUESTIONS = [
@@ -300,24 +300,30 @@ def grade_documents(state: State) -> State:
     return {"relevant_docs": [d for d, g in zip(docs, grades) if g.is_relevant]}
 
 # ---------- Node: GENERATE from relevant chunks ----------
+def source_label(doc: Document) -> str:
+    """[file p.N] for PDF chunks, [web: title (url)] for web results."""
+    if doc.metadata.get("url"):
+        return f"web: {doc.metadata.get('source', '?')} ({doc.metadata['url']})"
+    return f"{doc.metadata.get('source', '?')} p.{doc.metadata.get('page', '?')}"
+
+
 def format_context(docs: List[Document]) -> str:
     """Label each chunk with its source so the answer can cite it."""
-    return "\n\n---\n\n".join(
-        f"[{d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}]\n{d.page_content}"
-        for d in docs
-    )
+    return "\n\n---\n\n".join(f"[{source_label(d)}]\n{d.page_content}" for d in docs)
 
 
 rag_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You answer questions about the company NexaAI Solutions using ONLY the "
-            "context below, which comes from internal company documents.\n\n"
+            "You answer the question using ONLY the context below. It comes either from "
+            "internal documents of the company NexaAI Solutions or from web search "
+            "results.\n\n"
             "Rules:\n"
             "- Do not use outside knowledge and do not add facts, opinions or "
             "interpretations that are not stated in the context.\n"
-            "- Cite the source label of every fact you use, e.g. [Company_Policies.pdf p.1].\n"
+            "- Cite the source label of every fact you use, e.g. "
+            "[Company_Policies.pdf p.1] or [web: Title (https://...)].\n"
             "- If the context only partly answers the question, answer that part and "
             "say what is missing.\n"
             "- If the context does not answer the question at all, reply exactly: "
@@ -634,12 +640,11 @@ def print_result(res: State) -> None:
 
     if res.get("docs"):
         relevant = res.get("relevant_docs", [])
-        print(f"\nRETRIEVED CHUNKS ({len(relevant)}/{len(res['docs'])} relevant):")
+        print(f"\nSOURCES ({len(relevant)}/{len(res['docs'])} relevant):")
         for d in res["docs"]:
             mark = "keep" if d in relevant else "drop"
             preview = d.page_content[:80].replace("\n", " ")
-            print(f"  [{mark}] {d.metadata.get('source', '?')} "
-                  f"p.{d.metadata.get('page', '?')}: {preview}")
+            print(f"  [{mark}] {source_label(d)}: {preview}")
 
     if res.get("support"):
         print(f"\nSUPPORT: {res['support']} (revisions: {res.get('revisions', 0)})")
