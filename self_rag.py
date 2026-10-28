@@ -625,6 +625,10 @@ def print_result(res: State) -> None:
     print("QUESTION:", res["question"])
     print("NEED RETRIEVAL:", res.get("need_retrieval"))
 
+    if res.get("rewrites"):
+        print(f"REWRITES: {res['rewrites']}/{MAX_REWRITES} "
+              f"(last query: {res['retrieval_query']})")
+
     if res.get("docs"):
         relevant = res.get("relevant_docs", [])
         print(f"\nRETRIEVED CHUNKS ({len(relevant)}/{len(res['docs'])} relevant):")
