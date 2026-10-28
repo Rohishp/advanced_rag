@@ -49,11 +49,14 @@ RECURSION_LIMIT = 50    # max graph steps per question
 NO_ANSWER = "I couldn't find this in the available sources."
 GRAPH_PNG = "self_rag_graph.png"
 
+
+CHAR_REPLACEMENTS = {"■": "₹"}
+
 TEST_QUESTIONS = [
-    "What is machine learning?",                                 # direct
-    "How many days of annual leave do employees get?",           # docs
-    "What does the Growth plan cost per user?",                  # docs (pricing)
-    "Who is the CEO of NexaAI?",                                 # docs
+    # "What is machine learning?",                                 # direct
+    # "How many days of annual leave do employees get?",           # docs
+    # "What does the Growth plan cost per user?",                  # docs (pricing)
+    # "Who is the CEO of NexaAI?",                                 # docs
     "Describe NexaAI's company culture.",                        # IsSUP strictness
     "What is the refund policy of NexaAI?",                      # not in docs
     "Who won the latest ICC Men's T20 World Cup match?",         # web fallback
@@ -62,8 +65,11 @@ TEST_QUESTIONS = [
 
 # 1) LOAD PDFs
 def clean(text: str) -> str:
-    """Strip lone surrogates that PDF extraction sometimes produces."""
-    return text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    """Strip lone surrogates and fix known extraction artifacts."""
+    text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
+    for wrong, right in CHAR_REPLACEMENTS.items():
+        text = text.replace(wrong, right)
+    return text
 
 
 def load_pdf(path: Path) -> list[Document]:
@@ -103,8 +109,17 @@ def chunk_id(doc: Document) -> str:
 
 
 def file_hash(path: Path) -> str:
-    """Fingerprint of the PDF file itself."""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Fingerprint of the PDF plus the settings that shape its chunks.
+
+    Changing CHUNK_SIZE, CHUNK_OVERLAP or CHAR_REPLACEMENTS re-indexes every PDF.
+    Changes to the loading code itself are not detected: delete DB_DIR then.
+    """
+    settings = json.dumps(
+        {"chunk_size": CHUNK_SIZE, "chunk_overlap": CHUNK_OVERLAP,
+         "char_replacements": CHAR_REPLACEMENTS},
+        sort_keys=True, ensure_ascii=False,
+    )
+    return hashlib.sha256(path.read_bytes() + settings.encode()).hexdigest()
 
 
 def delete_source(source: str) -> None:
@@ -339,8 +354,7 @@ rag_prompt = ChatPromptTemplate.from_messages(
             "champion' in the context, and say which of these the answer is based on.\n"
             "- If the context does not answer the question at all, reply exactly: "
             "\"{no_answer}\"\n"
-            "- Do not mention 'the context' in your answer.\n"
-            "- The symbol ■ stands for the Indian rupee sign (₹).",
+            "- Do not mention 'the context' in your answer.\n",
         ),
         ("human", "Question: {question}\n\nContext:\n{context}"),
     ]
@@ -442,7 +456,6 @@ revise_prompt = ChatPromptTemplate.from_messages(
             "- If the question asks for something the documents do not describe "
             "directly (e.g. 'culture'), say so, then list what they do state.\n"
             "- Put the source label after each fact, e.g. [Company_Policies.pdf p.1].\n"
-            "- The symbol ■ stands for the Indian rupee sign (₹).\n"
             "- If nothing in the context answers the question, reply exactly: "
             "\"{no_answer}\"",
         ),
