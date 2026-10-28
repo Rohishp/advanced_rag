@@ -51,6 +51,12 @@ GRAPH_PNG = "self_rag_graph.png"
 
 
 CHAR_REPLACEMENTS = {"■": "₹"}
+# What the knowledge base contains; used by the prompts that need to know.
+KB_DESCRIPTION = (
+    "internal documents of the company NexaAI Solutions: HR and leave policies, "
+    "workplace conduct, the company profile and leadership team, and its products, "
+    "pricing plans and billing"
+)
 
 TEST_QUESTIONS = [
     # "What is machine learning?",                                 # direct
@@ -223,7 +229,7 @@ class State(TypedDict, total=False):
 # ---------- Node: DECIDE whether retrieval is needed ----------
 class RetrieveDecision(BaseModel):
     should_retrieve: bool = Field(
-        description="True if the question needs the company knowledge base or "
+        description="True if the question needs the knowledge base or "
                     "other external/up-to-date sources; False for general knowledge."
     )
 
@@ -233,12 +239,10 @@ decide_retrieval_prompt = ChatPromptTemplate.from_messages(
         (
             "system",
             "You decide whether a question needs retrieval before answering.\n\n"
-            "The internal knowledge base contains documents about the company "
-            "NexaAI Solutions: HR policies and leave policies, the company profile "
-            "and leadership team, and its products and pricing plans.\n\n"
+            "The knowledge base contains {kb_description}.\n\n"
             "Set should_retrieve=true if:\n"
-            "- the question is about NexaAI (its people, policies, products, plans, "
-            "prices, culture, or anything else company-specific), or\n"
+            "- the question is about anything the knowledge base covers, including the "
+            "organizations, people, products and topics it describes, or\n"
             "- it needs recent, current or fast-changing information (news, results, "
             "latest events), or specific facts you cannot answer reliably.\n"
             "Set should_retrieve=false only for general, timeless knowledge "
@@ -247,7 +251,8 @@ decide_retrieval_prompt = ChatPromptTemplate.from_messages(
         ),
         ("human", "Question: {question}"),
     ]
-)
+).partial(kb_description=KB_DESCRIPTION)
+
 decide_retrieval_chain = decide_retrieval_prompt | llm.with_structured_output(RetrieveDecision)
 
 
@@ -291,20 +296,14 @@ relevance_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You judge whether a retrieved document chunk is relevant to a question, "
-            "at the TOPIC level.\n\n"
+            "You judge whether a retrieved chunk is relevant to a question, at the "
+            "TOPIC level.\n\n"
             "A chunk is relevant if it discusses the same entity or topic area as the "
             "question. It does NOT need to contain the exact answer; whether the answer "
-            "is actually supported is checked later.\n\n"
-            "Examples:\n"
-            "- HR or leave policies are relevant to questions about leave, probation, "
-            "notice periods, benefits or working conditions.\n"
-            "- Product and pricing chunks are relevant to questions about plans, prices, "
-            "trials, billing or refunds.\n"
-            "- Company profile chunks are relevant to questions about leadership, "
-            "history, size, vision or culture.\n\n"
-            "A chunk is NOT relevant if it is about a clearly different subject "
-            "(e.g. company documents for a question about sports or world news).\n"
+            "is supported is checked later.\n\n"
+            "A chunk is NOT relevant if it is about a clearly different subject, or "
+            "about a different organization, person or product than the one asked "
+            "about, even if the names are similar.\n"
             "When unsure, set is_relevant=true.",
         ),
         ("human", "Question: {question}\n\nChunk:\n{chunk}"),
@@ -339,26 +338,25 @@ rag_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You answer the question using ONLY the context below. It comes either from "
-            "internal documents of the company NexaAI Solutions or from web search "
-            "results.\n\n"
+            "You answer the question using ONLY the context below. It comes from the "
+            "knowledge base ({kb_description}) or from web search results.\n\n"
             "Rules:\n"
             "- Do not use outside knowledge and do not add facts, opinions or "
             "interpretations that are not stated in the context.\n"
-            "- Cite the source label of every fact you use, e.g. "
-            "[Company_Policies.pdf p.1] or [web: Title (https://...)].\n"
+            "- Cite the source label of every fact you use, exactly as it appears in "
+            "the context.\n"
             "- If the context only partly answers the question, answer that part and "
             "say what is missing.\n"
-            "- If the question asks for the latest or most recent item, identify it from "
-            "explicit dates, stages (e.g. 'final') or statements such as 'current "
-            "champion' in the context, and say which of these the answer is based on.\n"
+            "- If the question asks for the latest or most recent item, identify it "
+            "from explicit dates, stages or titles in the context, and say which of "
+            "these the answer is based on.\n"
             "- If the context does not answer the question at all, reply exactly: "
             "\"{no_answer}\"\n"
-            "- Do not mention 'the context' in your answer.\n",
+            "- Do not mention 'the context' in your answer.",
         ),
         ("human", "Question: {question}\n\nContext:\n{context}"),
     ]
-)
+).partial(kb_description=KB_DESCRIPTION, no_answer=NO_ANSWER)
 
 
 def generate(state: State) -> State:
@@ -397,30 +395,26 @@ support_prompt = ChatPromptTemplate.from_messages(
             "You verify whether an ANSWER is supported by the CONTEXT it was generated "
             "from. Use only the context, never outside knowledge.\n\n"
             "- fully_supported: every factual claim is stated in the context. Close "
-            "paraphrases are fine. Sentences saying the documents do not cover something "
-            "(e.g. 'the documents do not directly describe the culture') are honest "
-            "limitations, not claims, and count as supported. Source labels like "
-            "[file p.N] are not claims either.\n"
-            "A conclusion that follows directly from explicitly stated dates, stages or "
-            "titles counts as supported when the answer names that basis (e.g. 'the "
-            "sources list India as the current champion').\n"
+            "paraphrases are fine. Sentences saying the sources do not cover something "
+            "are honest limitations, not claims, and count as supported. Source labels "
+            "are not claims either. A conclusion that follows directly from explicitly "
+            "stated dates, stages or titles counts as supported when the answer names "
+            "that basis.\n"
             "- partially_supported: the core facts are in the context, but the answer "
             "adds anything that is not: interpretive or qualitative words (e.g. "
-            "'generous', 'emphasizes', 'strong', 'employee-first'), inferred causes or "
-            "links (e.g. 'supports X through Y'), generalizations, or claiming the "
-            "documents describe something they do not (e.g. presenting a policy as "
-            "the company culture). Noting that the documents do not describe something "
-            "directly and then listing what they do state is fine.\n"
+            "'generous', 'robust', 'best-in-class'), inferred causes or links, "
+            "generalizations, or claiming the sources describe something they do not. "
+            "Noting that the sources do not describe something directly and then "
+            "listing what they do state is fine.\n"
             "- no_support: the key claims are not in the context.\n\n"
             "Be strict about claims: a single unsupported word or link makes it "
             "partially_supported.\n"
             "An answer that only says the information could not be found is "
             "fully_supported.",
         ),
-        ("human", "Question: {question}\n\nAnswer:\n{answer}\n\nContext:\n{context}"),
+        ("human", "Answer:\n{answer}\n\nContext:\n{context}"),
     ]
 )
-support_chain = support_prompt | llm.with_structured_output(SupportCheck)
 
 def normalize(text: str) -> str:
     """Lower-case and straighten curly apostrophes for robust comparisons."""
@@ -453,9 +447,10 @@ revise_prompt = ChatPromptTemplate.from_messages(
             "- Keep only facts stated in the context; remove everything the reviewer "
             "flagged and any other interpretation, judgement or inferred link.\n"
             "- Stay close to the wording of the context; quote it where helpful.\n"
-            "- If the question asks for something the documents do not describe "
-            "directly (e.g. 'culture'), say so, then list what they do state.\n"
-            "- Put the source label after each fact, e.g. [Company_Policies.pdf p.1].\n"
+            "- If the question asks for something the sources do not describe "
+            "directly, say so, then list what they do state.\n"
+            "- Put the source label after each fact, exactly as it appears in the "
+            "context.\n"
             "- If nothing in the context answers the question, reply exactly: "
             "\"{no_answer}\"",
         ),
@@ -465,7 +460,7 @@ revise_prompt = ChatPromptTemplate.from_messages(
             "Reviewer feedback:\n{feedback}\n\nContext:\n{context}",
         ),
     ]
-)
+).partial(no_answer=NO_ANSWER)
 
 
 def revise_answer(state: State) -> State:
@@ -491,12 +486,12 @@ usefulness_prompt = ChatPromptTemplate.from_messages(
             "You judge whether an ANSWER is useful for the QUESTION, i.e. whether it "
             "actually gives the user what they asked for.\n\n"
             "- useful: the answer provides the requested information. An answer that "
-            "notes a limitation (e.g. 'the documents do not describe this directly') "
-            "but still gives relevant, specific information is useful.\n"
+            "notes a limitation but still gives relevant, specific information is "
+            "useful.\n"
             "- not_useful: the answer's main content is that the information could not "
-            "be found or is not available, in any wording (e.g. 'No refund policy was "
-            "found'). Mentioning the topic does not make it useful. Also not_useful: "
-            "generic, off-topic, or only background without answering.\n\n"
+            "be found or is not available, in any wording. Mentioning the topic does "
+            "not make it useful. Also not_useful: generic, off-topic, or only "
+            "background without answering.\n\n"
             "Do NOT check whether the answer is correct or grounded; that was verified "
             "before. Only judge: does it give the user the requested information?",
         ),
@@ -526,15 +521,12 @@ rewrite_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "You rewrite a question into a search query for a vector store of internal "
-            "NexaAI Solutions documents: HR and leave policies, workplace conduct, "
-            "company profile and leadership, products, pricing plans, billing and "
-            "discounts.\n\n"
+            "You rewrite a question into a search query for a vector store "
+            "containing {kb_description}.\n\n"
             "Rules:\n"
             "- Output 4-12 keywords, not a full sentence.\n"
-            "- Keep key entities (NexaAI, plan or product names).\n"
-            "- Add terms and synonyms likely to appear in such documents "
-            "(e.g. refund -> refund cancellation money-back billing invoice).\n"
+            "- Keep key entities (names of organizations, people, products, plans).\n"
+            "- Add terms and synonyms likely to appear in such documents.\n"
             "- The query must differ from the previous query: use different "
             "vocabulary or a different angle.\n"
             "- Never answer the question.",
@@ -545,7 +537,7 @@ rewrite_prompt = ChatPromptTemplate.from_messages(
             "Why the previous attempt failed: {failure}",
         ),
     ]
-)
+).partial(kb_description=KB_DESCRIPTION)
 rewrite_chain = rewrite_prompt | llm.with_structured_output(RetrievalQuery)
 
 def fresh_pass() -> State:
