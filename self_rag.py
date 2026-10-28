@@ -366,8 +366,10 @@ support_prompt = ChatPromptTemplate.from_messages(
             "as facts about culture.\n"
             "- no_support: the key claims are not in the context.\n\n"
             "Be strict: a single unsupported word or link makes it partially_supported.\n"
-            "Source labels like [file p.N] and statements about what information is "
-            "missing are not claims.\n"
+            "These are NOT claims and must never lower the verdict:\n"
+            "- source labels like [file p.N];\n"
+            "- statements about what the documents do not contain, e.g. 'the documents "
+            "do not describe the culture directly' or 'no refund policy is mentioned'.\n"
             "An answer that only says the information could not be found is "
             "fully_supported.",
         ),
