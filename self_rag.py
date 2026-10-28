@@ -4,25 +4,23 @@ Configure the corpus in the CONFIG block; the graph flow is documented in build_
 """
 
 # ---------- Standard library ----------
-import hashlib
-import json
 from datetime import date
 from pathlib import Path
 from typing import List, Literal, Optional, TypedDict
 
 # ---------- Third-party ----------
-import pymupdf4llm
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 # ---------- LangChain / LangGraph ----------
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_tavily import TavilySearch
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, START, StateGraph
+
+# ---------- Local ----------
+from rag_common import CorpusConfig, PdfIndex
 
 load_dotenv()
 
@@ -33,7 +31,6 @@ load_dotenv()
 DOCS_DIR = Path("./company_docs")          # PDFs to index
 DB_DIR = Path("./chroma_company")          # Chroma storage
 COLLECTION = "company"
-MANIFEST = DB_DIR / "manifest.json"        # fingerprint per indexed PDF
 
 # What the knowledge base contains; used by the prompts that need to know.
 KB_DESCRIPTION = (
@@ -49,7 +46,6 @@ LLM_MODEL = "gpt-5.4-mini"
 CHUNK_SIZE = 300        # tokens per chunk (short documents -> small chunks)
 CHUNK_OVERLAP = 50      # tokens shared between neighbouring chunks
 RETRIEVER_K = 4         # chunks returned per query
-INDEX_BATCH = 500       # max IDs per Chroma add/delete call
 WEB_MAX_RESULTS = 5     # Tavily results for the web fallback
 
 MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
@@ -74,124 +70,18 @@ TEST_QUESTIONS = [
 # ======================================================================
 # CLIENTS
 # ======================================================================
-splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+corpus = CorpusConfig(
+    docs_dir=DOCS_DIR,
+    db_dir=DB_DIR,
+    collection=COLLECTION,
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
+    char_replacements=CHAR_REPLACEMENTS,
 )
-vector_store = Chroma(
-    collection_name=COLLECTION,
-    embedding_function=OpenAIEmbeddings(model=EMBED_MODEL),
-    persist_directory=str(DB_DIR),
-)
-retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
+index = PdfIndex(corpus, OpenAIEmbeddings(model=EMBED_MODEL))
+retriever = index.store.as_retriever(search_kwargs={"k": RETRIEVER_K})
 llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
 tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general", search_depth="advanced")
-
-
-# ======================================================================
-# LOAD PDFs
-# ======================================================================
-def clean(text: str) -> str:
-    """Strip lone surrogates and fix known extraction artifacts."""
-    text = text.encode("utf-8", "ignore").decode("utf-8", "ignore")
-    for wrong, right in CHAR_REPLACEMENTS.items():
-        text = text.replace(wrong, right)
-    return text
-
-
-def load_pdf(path: Path) -> List[Document]:
-    """Read one PDF as Markdown, one Document per non-empty page."""
-    pages = pymupdf4llm.to_markdown(str(path), page_chunks=True)
-    return [
-        Document(
-            page_content=clean(p["text"]),
-            metadata={
-                "source": path.name,
-                # key differs between pymupdf4llm versions; never store None
-                # (Chroma silently drops None metadata values)
-                "page": p["metadata"].get("page") or p["metadata"].get("page_number") or n,
-            },
-        )
-        for n, p in enumerate(pages, 1)
-        if p["text"].strip()
-    ]
-
-
-# ======================================================================
-# INDEX (persistent; unchanged PDFs are skipped without loading)
-# ======================================================================
-def chunk_id(doc: Document) -> str:
-    """Stable ID from source + page + text, so re-runs skip existing chunks."""
-    key = f"{doc.metadata['source']}|{doc.metadata['page']}|{doc.page_content}"
-    return hashlib.sha256(key.encode()).hexdigest()
-
-
-def pdf_fingerprint(path: Path) -> str:
-    """Hash of the PDF plus the settings that shape its chunks (changing them re-indexes)."""
-    settings = json.dumps(
-        {"chunk_size": CHUNK_SIZE, "chunk_overlap": CHUNK_OVERLAP,
-         "char_replacements": CHAR_REPLACEMENTS},
-        sort_keys=True, ensure_ascii=False,
-    )
-    return hashlib.sha256(path.read_bytes() + settings.encode()).hexdigest()
-
-
-def delete_source(source: str) -> None:
-    """Remove all chunks that came from one PDF."""
-    old_ids = vector_store.get(where={"source": source}, include=[])["ids"]
-    for start in range(0, len(old_ids), INDEX_BATCH):
-        vector_store.delete(ids=old_ids[start:start + INDEX_BATCH])
-
-
-def save_manifest(manifest: dict) -> None:
-    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    MANIFEST.write_text(json.dumps(manifest, indent=2))
-
-
-def index_folder(folder: Path) -> None:
-    """Index new or changed PDFs, skip unchanged ones, drop removed ones."""
-    if not folder.is_dir():
-        raise FileNotFoundError(f"PDF folder not found: {folder.resolve()}")
-
-    manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
-    pdfs = sorted(folder.glob("*.pdf"))
-
-    for name in set(manifest) - {p.name for p in pdfs}:   # PDFs removed from the folder
-        delete_source(name)
-        del manifest[name]
-        save_manifest(manifest)
-        print(f"{name}: removed from folder, chunks deleted")
-
-    for pdf in pdfs:
-        fingerprint = pdf_fingerprint(pdf)
-        if manifest.get(pdf.name) == fingerprint:
-            print(f"{pdf.name}: unchanged, skipped")
-            continue
-
-        if pdf.name in manifest:  # changed file or settings: drop its old chunks first
-            delete_source(pdf.name)
-
-        chunks = splitter.split_documents(load_pdf(pdf))
-
-        # De-duplicate identical chunks (Chroma raises DuplicateIDError otherwise)
-        unique: dict[str, Document] = {}
-        for c in chunks:
-            unique.setdefault(chunk_id(c), c)
-        ids = list(unique)
-
-        existing = set(vector_store.get(ids=ids, include=[])["ids"]) if ids else set()
-        new_ids = [i for i in ids if i not in existing]
-        for start in range(0, len(new_ids), INDEX_BATCH):
-            batch = new_ids[start:start + INDEX_BATCH]
-            vector_store.add_documents([unique[i] for i in batch], ids=batch)
-
-        print(f"{pdf.name}: {len(chunks)} chunks, {len(ids)} unique, "
-              f"{len(new_ids)} newly embedded")
-
-        manifest[pdf.name] = fingerprint   # save after each PDF to keep progress
-        save_manifest(manifest)
-
-    total = len(vector_store.get(include=[])["ids"])
-    print(f"Collection '{COLLECTION}': {total} chunks in total")
 
 
 # ======================================================================
@@ -664,7 +554,7 @@ def print_result(res: State) -> None:
 
 
 def main() -> None:
-    index_folder(DOCS_DIR)
+    index.sync()
     app = build_graph()
     save_graph_diagram(app)
     for q in TEST_QUESTIONS:
