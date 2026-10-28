@@ -401,9 +401,16 @@ support_prompt = ChatPromptTemplate.from_messages(
 )
 support_chain = support_prompt | llm.with_structured_output(SupportCheck)
 
+def normalize(text: str) -> str:
+    """Lower-case and straighten curly apostrophes for robust comparisons."""
+    return text.strip().replace("\u2019", "'").lower()
+
+
+def is_not_found(answer: str) -> bool:
+    return normalize(answer) == normalize(NO_ANSWER)
 
 def check_support(state: State) -> State:
-    if state["answer"].strip() == NO_ANSWER:  # nothing claimed, nothing to verify
+    if is_not_found(state["answer"]):  # nothing claimed, nothing to verify
         return {"support": "fully_supported", "evidence": [],
                 "support_reason": "The answer states that the information was not found."}
 
@@ -463,14 +470,15 @@ usefulness_prompt = ChatPromptTemplate.from_messages(
             "system",
             "You judge whether an ANSWER is useful for the QUESTION, i.e. whether it "
             "actually gives the user what they asked for.\n\n"
-            "- useful: the answer directly addresses the question or provides the "
-            "requested information. An answer that notes a limitation (e.g. 'the "
-            "documents do not describe this directly') but still gives relevant, "
-            "specific information is useful.\n"
-            "- not_useful: the answer says the information could not be found, "
-            "is generic or off-topic, or only gives background without answering.\n\n"
+            "- useful: the answer provides the requested information. An answer that "
+            "notes a limitation (e.g. 'the documents do not describe this directly') "
+            "but still gives relevant, specific information is useful.\n"
+            "- not_useful: the answer's main content is that the information could not "
+            "be found or is not available, in any wording (e.g. 'No refund policy was "
+            "found'). Mentioning the topic does not make it useful. Also not_useful: "
+            "generic, off-topic, or only background without answering.\n\n"
             "Do NOT check whether the answer is correct or grounded; that was verified "
-            "before. Only judge: does it answer the question?",
+            "before. Only judge: does it give the user the requested information?",
         ),
         ("human", "Question: {question}\n\nAnswer:\n{answer}"),
     ]
@@ -479,7 +487,7 @@ usefulness_chain = usefulness_prompt | llm.with_structured_output(UsefulnessChec
 
 
 def check_usefulness(state: State) -> State:
-    if state["answer"].strip() == NO_ANSWER:  # "not found" never answers the question
+    if is_not_found(state["answer"]):  # "not found" never answers the question
         return {"usefulness": "not_useful",
                 "usefulness_reason": "The answer states that the information was not found."}
 
