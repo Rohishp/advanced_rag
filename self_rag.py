@@ -39,6 +39,7 @@ LLM_MODEL = "gpt-5.4-mini"
 CHUNK_SIZE = 300        # tokens per chunk (short documents -> small chunks)
 CHUNK_OVERLAP = 50      # tokens shared between neighbouring chunks
 RETRIEVER_K = 4         # chunks returned per query
+MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
 INDEX_BATCH = 500       # max IDs per Chroma add/delete call
 
 RECURSION_LIMIT = 50    # max graph steps per question
@@ -176,6 +177,8 @@ class State(TypedDict, total=False):
     docs: List[Document]
     # generate_direct
     answer: str
+    # grade_documents
+    relevant_docs: List[Document]
 
 
 # 4) NODES (in execution order)
@@ -240,6 +243,47 @@ def generate_direct(state: State) -> State:
 def retrieve(state: State) -> State:
     return {"docs": retriever.invoke(state["question"])}
 
+# ---------- Node: GRADE retrieved chunks (topic-level, lenient) ----------
+class RelevanceGrade(BaseModel):
+    is_relevant: bool = Field(
+        description="True if the chunk is about the same entity or topic area as the question."
+    )
+
+
+relevance_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You judge whether a retrieved document chunk is relevant to a question, "
+            "at the TOPIC level.\n\n"
+            "A chunk is relevant if it discusses the same entity or topic area as the "
+            "question. It does NOT need to contain the exact answer; whether the answer "
+            "is actually supported is checked later.\n\n"
+            "Examples:\n"
+            "- HR or leave policies are relevant to questions about leave, probation, "
+            "notice periods, benefits or working conditions.\n"
+            "- Product and pricing chunks are relevant to questions about plans, prices, "
+            "trials, billing or refunds.\n"
+            "- Company profile chunks are relevant to questions about leadership, "
+            "history, size, vision or culture.\n\n"
+            "A chunk is NOT relevant if it is about a clearly different subject "
+            "(e.g. company documents for a question about sports or world news).\n"
+            "When unsure, set is_relevant=true.",
+        ),
+        ("human", "Question: {question}\n\nChunk:\n{chunk}"),
+    ]
+)
+relevance_chain = relevance_prompt | llm.with_structured_output(RelevanceGrade)
+
+
+def grade_documents(state: State) -> State:
+    """Grade all retrieved chunks in parallel; keep the relevant ones."""
+    docs = state.get("docs", [])
+    grades = relevance_chain.batch(
+        [{"question": state["question"], "chunk": d.page_content} for d in docs],
+        config={"max_concurrency": MAX_CONCURRENCY},
+    )
+    return {"relevant_docs": [d for d, g in zip(docs, grades) if g.is_relevant]}
 
 # ---------- Routing ----------
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
@@ -248,11 +292,12 @@ def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
 
 # BUILD GRAPH
 def build_graph():
-    """START -> decide_retrieval -> (generate_direct | retrieve) -> END"""
+    """START -> decide_retrieval -> (generate_direct | retrieve -> grade_documents) -> END"""
     g = StateGraph(State)
     g.add_node("decide_retrieval", decide_retrieval)
     g.add_node("generate_direct", generate_direct)
     g.add_node("retrieve", retrieve)
+    g.add_node("grade_documents", grade_documents)
 
     g.add_edge(START, "decide_retrieval")
     g.add_conditional_edges(
@@ -261,7 +306,8 @@ def build_graph():
         {"retrieve": "retrieve", "generate_direct": "generate_direct"},
     )
     g.add_edge("generate_direct", END)
-    g.add_edge("retrieve", END)  # temporary: grading follows in step 3
+    g.add_edge("retrieve", "grade_documents")
+    g.add_edge("grade_documents", END)  # temporary end of the retrieval path
     return g.compile()
 
 
