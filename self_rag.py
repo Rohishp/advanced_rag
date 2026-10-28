@@ -7,7 +7,7 @@ The graph flow is documented in build_graph().
 import hashlib
 import json
 from pathlib import Path
-from typing import List, Literal, TypedDict
+from typing import List, Literal, Optional, TypedDict
 
 # ---------- Third-party ----------
 import pymupdf4llm
@@ -39,6 +39,7 @@ CHUNK_OVERLAP = 50      # tokens shared between neighbouring chunks
 RETRIEVER_K = 4         # chunks returned per query
 MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
 MAX_REVISIONS = 2       # support-driven rewrites per answer
+MAX_REWRITES = 2        # retrieval retries with a rewritten query
 INDEX_BATCH = 500       # max IDs per Chroma add/delete call
 
 RECURSION_LIMIT = 50    # max graph steps per question
@@ -171,21 +172,27 @@ llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
 class State(TypedDict, total=False):
     """Data flowing through the graph; each node returns only what it changes."""
     question: str
-    
-    need_retrieval: bool # decide_retrieval
-    
-    docs: List[Document] # retrieve
-    
-    answer: str # generate_direct
-    
-    relevant_docs: List[Document]   # grade_documents
-    
-    context: str    # generate
-    support: Literal["fully_supported", "partially_supported", "no_support"]
+    # decide_retrieval
+    need_retrieval: bool
+    # rewrite_question
+    retrieval_query: str
+    rewrites: int
+    # retrieve
+    docs: List[Document]
+    # grade_documents
+    relevant_docs: List[Document]
+    # generate, generate_direct, revise_answer, no_answer
+    context: str
+    answer: str
+    # check_support
+    support: Optional[Literal["fully_supported", "partially_supported", "no_support"]]
     evidence: List[str]
     support_reason: str
-        
-    revisions: int  # revise_answer
+    # revise_answer
+    revisions: int
+    # check_usefulness
+    usefulness: Optional[Literal["useful", "not_useful"]]
+    usefulness_reason: str
 
 
 # 4) NODES (in execution order)
@@ -248,7 +255,7 @@ def generate_direct(state: State) -> State:
 
 # ---------- Node: RETRIEVE ----------
 def retrieve(state: State) -> State:
-    return {"docs": retriever.invoke(state["question"])}
+    return {"docs": retriever.invoke(state.get("retrieval_query") or state["question"])}
 
 # ---------- Node: GRADE retrieved chunks (topic-level, lenient) ----------
 class RelevanceGrade(BaseModel):
@@ -425,12 +432,108 @@ def revise_answer(state: State) -> State:
     return {"answer": out.content, "revisions": state.get("revisions", 0) + 1}
 
 
+# ---------- Node: CHECK USEFULNESS (IsUSE) ----------
+class UsefulnessCheck(BaseModel):
+    # reason comes before the verdict so the model reasons first
+    reason: str = Field(description="One short line explaining the verdict.")
+    usefulness: Literal["useful", "not_useful"]
+
+
+usefulness_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You judge whether an ANSWER is useful for the QUESTION, i.e. whether it "
+            "actually gives the user what they asked for.\n\n"
+            "- useful: the answer directly addresses the question or provides the "
+            "requested information. An answer that notes a limitation (e.g. 'the "
+            "documents do not describe this directly') but still gives relevant, "
+            "specific information is useful.\n"
+            "- not_useful: the answer says the information could not be found, "
+            "is generic or off-topic, or only gives background without answering.\n\n"
+            "Do NOT check whether the answer is correct or grounded; that was verified "
+            "before. Only judge: does it answer the question?",
+        ),
+        ("human", "Question: {question}\n\nAnswer:\n{answer}"),
+    ]
+)
+usefulness_chain = usefulness_prompt | llm.with_structured_output(UsefulnessCheck)
+
+
+def check_usefulness(state: State) -> State:
+    if state["answer"].strip() == NO_ANSWER:  # "not found" never answers the question
+        return {"usefulness": "not_useful",
+                "usefulness_reason": "The answer states that the information was not found."}
+
+    out = usefulness_chain.invoke(
+        {"question": state["question"], "answer": state["answer"]}
+    )
+    return {"usefulness": out.usefulness, "usefulness_reason": out.reason}
+
+
+# ---------- Node: REWRITE the question into a better retrieval query ----------
+class RetrievalQuery(BaseModel):
+    query: str = Field(description="Keyword search query, 4-12 words, not a sentence.")
+
+
+rewrite_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You rewrite a question into a search query for a vector store of internal "
+            "NexaAI Solutions documents: HR and leave policies, workplace conduct, "
+            "company profile and leadership, products, pricing plans, billing and "
+            "discounts.\n\n"
+            "Rules:\n"
+            "- Output 4-12 keywords, not a full sentence.\n"
+            "- Keep key entities (NexaAI, plan or product names).\n"
+            "- Add terms and synonyms likely to appear in such documents "
+            "(e.g. refund -> refund cancellation money-back billing invoice).\n"
+            "- The query must differ from the previous query: use different "
+            "vocabulary or a different angle.\n"
+            "- Never answer the question.",
+        ),
+        (
+            "human",
+            "Question: {question}\n\nPrevious query: {previous}\n\n"
+            "Why the previous attempt failed: {failure}",
+        ),
+    ]
+)
+rewrite_chain = rewrite_prompt | llm.with_structured_output(RetrievalQuery)
+
+
+def rewrite_question(state: State) -> State:
+    if state.get("usefulness") == "not_useful":
+        failure = state["usefulness_reason"]
+    else:
+        failure = "None of the retrieved chunks was relevant to the question."
+
+    out = rewrite_chain.invoke(
+        {"question": state["question"],
+         "previous": state.get("retrieval_query") or state["question"],
+         "failure": failure}
+    )
+    # new retrieval pass: reset the revision budget and clear the old verdicts
+    return {"retrieval_query": out.query, "rewrites": state.get("rewrites", 0) + 1,
+            "revisions": 0,
+            "support": None, "evidence": [], "support_reason": "",
+            "usefulness": None, "usefulness_reason": ""}
+
+
 # ---------- Routing ----------
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
     return "retrieve" if state["need_retrieval"] else "generate_direct"
 
-def route_after_grade(state: State) -> Literal["generate", "no_answer"]:
-    return "generate" if state.get("relevant_docs") else "no_answer"
+
+def can_rewrite(state: State) -> bool:
+    return state.get("rewrites", 0) < MAX_REWRITES
+
+
+def route_after_grade(state: State) -> Literal["generate", "rewrite_question", "no_answer"]:
+    if state.get("relevant_docs"):
+        return "generate"
+    return "rewrite_question" if can_rewrite(state) else "no_answer"
 
 
 def route_after_support(state: State) -> Literal["revise_answer", "accept"]:
@@ -441,22 +544,35 @@ def route_after_support(state: State) -> Literal["revise_answer", "accept"]:
     return "revise_answer"
 
 
+def route_after_usefulness(state: State) -> Literal["done", "rewrite_question", "no_answer"]:
+    if state["usefulness"] == "useful":
+        return "done"
+    return "rewrite_question" if can_rewrite(state) else "no_answer"
+
+
 # BUILD GRAPH
 def build_graph():
-    """START -> decide_retrieval -> (generate_direct
-                                     | retrieve -> grade_documents
-                                       -> (generate -> check_support <-> revise_answer
-                                           | no_answer)) -> END"""
+    """START -> decide_retrieval
+         -> generate_direct -> END
+         -> retrieve -> grade_documents
+              -> generate -> check_support <-> revise_answer -> check_usefulness
+                   -> END                                   (useful)
+                   -> rewrite_question -> retrieve           (not useful, retries left)
+                   -> no_answer -> END                       (not useful, no retries left)
+              -> rewrite_question -> retrieve                (no relevant chunks, retries left)
+              -> no_answer -> END                            (no relevant chunks, no retries left)
+    """
     g = StateGraph(State)
     g.add_node("decide_retrieval", decide_retrieval)
     g.add_node("generate_direct", generate_direct)
     g.add_node("retrieve", retrieve)
     g.add_node("grade_documents", grade_documents)
     g.add_node("generate", generate)
-    g.add_node("no_answer", no_answer)
     g.add_node("check_support", check_support)
     g.add_node("revise_answer", revise_answer)
-
+    g.add_node("check_usefulness", check_usefulness)
+    g.add_node("rewrite_question", rewrite_question)
+    g.add_node("no_answer", no_answer)
 
     g.add_edge(START, "decide_retrieval")
     g.add_conditional_edges(
@@ -465,19 +581,30 @@ def build_graph():
         {"retrieve": "retrieve", "generate_direct": "generate_direct"},
     )
     g.add_edge("generate_direct", END)
+
     g.add_edge("retrieve", "grade_documents")
     g.add_conditional_edges(
         "grade_documents",
         route_after_grade,
-        {"generate": "generate", "no_answer": "no_answer"},
+        {"generate": "generate", "rewrite_question": "rewrite_question",
+         "no_answer": "no_answer"},
     )
+
     g.add_edge("generate", "check_support")
     g.add_conditional_edges(
         "check_support",
         route_after_support,
-        {"revise_answer": "revise_answer", "accept": END},
+        {"revise_answer": "revise_answer", "accept": "check_usefulness"},
     )
     g.add_edge("revise_answer", "check_support")
+
+    g.add_conditional_edges(
+        "check_usefulness",
+        route_after_usefulness,
+        {"done": END, "rewrite_question": "rewrite_question", "no_answer": "no_answer"},
+    )
+
+    g.add_edge("rewrite_question", "retrieve")
     g.add_edge("no_answer", END)
     return g.compile()
 
@@ -512,6 +639,10 @@ def print_result(res: State) -> None:
         print(f"  {res['support_reason']}")
         for quote in res.get("evidence", []):
             print(f'  > "{quote}"')
+    
+    if res.get("usefulness"):
+        print(f"\nUSEFULNESS: {res['usefulness']}")
+        print(f"  {res['usefulness_reason']}")
 
     print("\nANSWER:\n" + res.get("answer", "(none)"))
 
