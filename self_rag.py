@@ -25,7 +25,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
-from typing import Annotated, List, Literal, Optional, TypedDict
+from typing import Annotated, List, Literal, Optional, Tuple, TypedDict
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 # ---------- Third-party ----------
 from dotenv import load_dotenv
@@ -205,11 +206,11 @@ class State(TypedDict, total=False):
     docs: List[Document]
     # grade_documents
     relevant_docs: List[Document]
-    # generate, generate_direct, revise_answer, no_answer
-    context: str
-    answer: str
+    # generate, generate_direct, revise_answer, label_citations, no_answer
+    context: str                           # sources as [S1], [S2], ... (format_context)
+    answer: str                            # cites ids until label_citations maps them
     # check_support
-    citation_errors: List[str]             # cited labels missing from the context
+    citation_errors: List[str]             # citations that are not ids from the context
     support: Optional[Literal["fully_supported", "partially_supported", "no_support"]]
     evidence: List[str]
     support_reason: str
@@ -357,24 +358,68 @@ def source_label(doc: Document) -> str:
     return _no_brackets(label)
 
 
+# The model cites short source ids ([S1], [S2], ... in the order of relevant_docs), not the
+# full labels: long web labels were cited without their URL (decision S9.20).
+# label_citations maps the ids back to the full labels once the answer is accepted.
+SOURCE_ID_PREFIX = "S"
+SOURCE_ID = re.compile(rf"{SOURCE_ID_PREFIX}\d+", re.IGNORECASE)
 CITATION = re.compile(r"\[([^\[\]\n]+)\](?!\()")   # [label], but not markdown [text](url)
 
 
+def source_ids(docs: List[Document]) -> List[Tuple[str, Document]]:
+    """(id, doc) for each context source: S1, S2, ... in the order of the docs."""
+    return [(f"{SOURCE_ID_PREFIX}{i}", d) for i, d in enumerate(docs, 1)]
+
+
 def cited_labels(answer: str) -> List[str]:
+    """Everything cited in [brackets]: source ids before label_citations, full labels after."""
     return [c.strip() for c in CITATION.findall(answer)]
 
 
+def split_ids(citation: str) -> Optional[List[str]]:
+    """'S1' or 'S1, S3' -> ['S1', 'S3']; None if the citation is not made of source ids."""
+    parts = [p.strip() for p in re.split(r"[,;]", citation)]
+    if not all(SOURCE_ID.fullmatch(p) for p in parts):
+        return None
+    return list(dict.fromkeys(p.upper() for p in parts))
+
+
 def citation_errors(answer: str, docs: List[Document]) -> List[str]:
-    """Deterministic check: every citation is a label from the context, and there is one."""
+    """Deterministic check: every citation is a source id from the context, and there is one."""
     cited = cited_labels(answer)
     if not cited:
         return ["the answer cites no sources"]
-    known = {source_label(d) for d in docs}
-    return [f"[{c}] is not a source label in the context" for c in cited if c not in known]
+    known = {sid for sid, _ in source_ids(docs)}
+    errors = []
+    for c in cited:
+        ids = split_ids(c)
+        if ids is None:
+            errors.append(f"[{c}] is not a source id")
+        else:
+            errors += [f"[{i}] is not a source id in the context" for i in ids if i not in known]
+    return list(dict.fromkeys(errors))
+
+
+def resolve_citations(answer: str, docs: List[Document]) -> str:
+    """Replace cited ids with the full source labels: [S1, S3] -> [label 1][label 3].
+
+    A citation that is not made of known ids stays as written (it is in citation_errors).
+    """
+    labels = {sid: source_label(d) for sid, d in source_ids(docs)}
+
+    def full(m: re.Match) -> str:
+        ids = split_ids(m.group(1))
+        if not ids or any(i not in labels for i in ids):
+            return m.group(0)
+        return "".join(f"[{labels[i]}]" for i in ids)
+
+    return CITATION.sub(full, answer)
 
 
 def format_context(docs: List[Document]) -> str:
-    return "\n\n---\n\n".join(f"[{source_label(d)}]\n{d.page_content}" for d in docs)
+    """Each source starts with its id, then its full label; the model cites the id."""
+    return "\n\n---\n\n".join(f"[{sid}] Source: {source_label(d)}\n{d.page_content}"
+                              for sid, d in source_ids(docs))
 
 
 generate_chain = ChatPromptTemplate.from_messages(
@@ -386,7 +431,9 @@ generate_chain = ChatPromptTemplate.from_messages(
             "- Do not add facts, opinions or interpretations that are not in the context.\n"
             "- Only use information about the entity the question asks about; never "
             "attribute information about a similarly named one to it.\n"
-            "- Cite the source label of every fact, exactly as it appears in the context.\n"
+            "- Cite every fact with the id of its source in square brackets, e.g. [S1], or "
+            "[S1][S3] for several sources. Cite only these ids, never source names, titles "
+            "or URLs.\n"
             "- If the context answers only part of the question, answer that part and "
             "say what is missing.\n"
             "- If it does not answer the question at all, reply exactly: \"{no_answer}\"\n"
@@ -432,8 +479,8 @@ support_chain = ChatPromptTemplate.from_messages(
             "- partially_supported: the core facts are in the context, but the answer "
             "adds interpretive wording, inferred links or generalizations that are not.\n"
             "- no_support: the key claims are not in the context.\n"
-            "Source labels and statements that the sources do not cover something are "
-            "not claims.",
+            "Source ids in square brackets (e.g. [S1]) and statements that the sources do "
+            "not cover something are not claims.",
         ),
         # no question: whether the answer addresses it is the usefulness check's job
         ("human", "Answer:\n{answer}\n\nContext:\n{context}"),
@@ -448,12 +495,14 @@ def check_support(state: State) -> State:
     if is_not_found(state["answer"]):  # nothing claimed, nothing to verify
         return {"citation_errors": [], "support": "fully_supported", "evidence": [],
                 "support_reason": "The answer states that nothing was found."}
-    errors = citation_errors(state["answer"], state.get("relevant_docs", []))
+    docs = state.get("relevant_docs", [])
+    errors = citation_errors(state["answer"], docs)
     if errors and can_revise(state):
+        ids = ", ".join(sid for sid, _ in source_ids(docs))
         return {"citation_errors": errors, "support": None, "evidence": [],
                 "support_reason": "Citation problems: " + "; ".join(errors) + ". Cite every "
-                                  "fact with a source label copied exactly from the context, "
-                                  "in square brackets."}
+                                  "fact with the id of its source in square brackets; the "
+                                  f"context's source ids are {ids}."}
     out = support_chain.invoke({"answer": state["answer"], "context": state["context"]})
     return {"citation_errors": errors, "support": out.support, "evidence": out.evidence,
             "support_reason": out.explanation, "llm_calls": 1}
@@ -466,7 +515,8 @@ revise_chain = ChatPromptTemplate.from_messages(
             "system",
             "Rewrite the answer so every statement is supported by the CONTEXT.\n"
             "- Remove what the reviewer flagged and any other interpretation.\n"
-            "- Stay close to the context's wording and keep the source labels.\n"
+            "- Stay close to the context's wording. Cite every fact with its source id in "
+            "square brackets (e.g. [S1]), never source names, titles or URLs.\n"
             "- If the sources do not describe what was asked directly, say so, then "
             "list what they do state.\n"
             "- If nothing in the context answers the question, reply exactly: "
@@ -487,6 +537,13 @@ def revise_answer(state: State) -> State:
          "feedback": state["support_reason"], "context": state["context"]}
     )
     return {"answer": out.content, "revisions": state.get("revisions", 0) + 1, "llm_calls": 1}
+
+
+# ---------- Node: LABEL CITATIONS (source ids -> full labels, in code) ----------
+def label_citations(state: State) -> State:
+    """The accepted answer cites ids; the usefulness check, the user and the evals see the
+    full source labels (file, page, section; web title and URL)."""
+    return {"answer": resolve_citations(state["answer"], state.get("relevant_docs", []))}
 
 
 # ---------- Node: CHECK USEFULNESS (IsUSE) ----------
@@ -592,8 +649,29 @@ def rewrite_web_query(state: State) -> State:
 
 
 # ---------- Node: WEB SEARCH (at most once per question) ----------
+def normalize_url(url: str) -> str:
+    """Comparison key for web results: percent-decoded, case-insensitive scheme and host,
+    no trailing slash, no fragment ('/a%27b/' and "/a'b" are one page)."""
+    parts = urlsplit(url.strip())
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                       unquote(parts.path).rstrip("/"), unquote(parts.query), ""))
+
+
+def dedupe_by_url(docs: List[Document]) -> List[Document]:
+    """Keep the first result per normalized URL (Tavily returns the best match first)."""
+    seen, unique = set(), []
+    for d in docs:
+        key = normalize_url(d.metadata.get("url", ""))
+        if key and key in seen:
+            continue
+        seen.add(key)
+        unique.append(d)
+    return unique
+
+
 def web_search(state: State) -> State:
-    """Page text goes into page_content; title and URL into metadata.
+    """Page text goes into page_content; title and URL into metadata. Results are
+    de-duplicated by normalized URL before grading.
 
     A failure (no API key, a non-retryable error, retries used up) is recorded in
     web_error and routes to no_answer; no results is not a failure.
@@ -609,7 +687,10 @@ def web_search(state: State) -> State:
                  metadata={"source": r.get("title") or "web", "url": r.get("url", "")})
         for r in response.get("results", []) if r.get("content")
     ]
-    return {"docs": docs, "web_searched": True, "web_error": ""}
+    unique = dedupe_by_url(docs)
+    if len(unique) < len(docs):
+        log.info("Web search: dropped %d duplicate result(s)", len(docs) - len(unique))
+    return {"docs": unique, "web_searched": True, "web_error": ""}
 
 
 # ---------- Node: NO ANSWER ----------
@@ -679,8 +760,10 @@ def build_graph():
     """START -> decide_retrieval
          -> generate_direct -> END
          -> retrieve -> grade_documents
-              -> generate -> check_support <-> revise_answer -> check_usefulness
+              -> generate -> check_support <-> revise_answer
                              (citations checked in code first, then support)
+                   -> label_citations -> check_usefulness
+                             (source ids replaced by the full labels, in code)
                    -> END                          (useful)
                    -> next attempt                 (not useful)
               -> next attempt                      (no relevant chunks)
@@ -698,7 +781,8 @@ def build_graph():
         ("decide_retrieval", decide_retrieval), ("generate_direct", generate_direct),
         ("retrieve", retrieve), ("grade_documents", grade_documents),
         ("generate", generate), ("check_support", check_support),
-        ("revise_answer", revise_answer), ("check_usefulness", check_usefulness),
+        ("revise_answer", revise_answer), ("label_citations", label_citations),
+        ("check_usefulness", check_usefulness),
         ("rewrite_question", rewrite_question), ("rewrite_web_query", rewrite_web_query),
         ("web_search", web_search), ("no_answer", no_answer),
     ]:
@@ -719,8 +803,9 @@ def build_graph():
 
     g.add_edge("generate", "check_support")
     g.add_conditional_edges("check_support", route_after_support,
-                            {"revise_answer": "revise_answer", "accept": "check_usefulness"})
+                            {"revise_answer": "revise_answer", "accept": "label_citations"})
     g.add_edge("revise_answer", "check_support")
+    g.add_edge("label_citations", "check_usefulness")
     g.add_conditional_edges("check_usefulness", route_after_usefulness,
                             {"done": END, **retry})
 
@@ -771,8 +856,9 @@ def print_result(res: State) -> None:
     if res.get("docs"):
         relevant = res.get("relevant_docs", [])
         print(f"\nSOURCES ({len(relevant)}/{len(res['docs'])} relevant):")
+        ids = source_ids(relevant)
         for d in res["docs"]:
-            mark = "keep" if d in relevant else "drop"
+            mark = next((f"keep {sid}" for sid, r in ids if r == d), "drop")
             print(f"  [{mark}] {source_label(d)}: {d.page_content[:80].replace(chr(10), ' ')}")
 
     if res.get("citation_errors"):

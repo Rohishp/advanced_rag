@@ -225,6 +225,7 @@ def make_target(index: PdfIndex):
             "usefulness_reason": res.get("usefulness_reason", ""),
             "rewrites": res.get("rewrites", 0),
             "revisions": res.get("revisions", 0),
+            "citation_errors": res.get("citation_errors") or [],
             "web_searched": bool(res.get("web_searched")),
             "web_error": res.get("web_error") or "",
             "llm_calls": counter.calls,
@@ -470,7 +471,8 @@ def summarize(rows: List[dict], experiment: str, corpus: str, reps: int, mode: s
         out = row["outputs"]
         paths[case_id].append(out.get("path"))
         scopes[case_id].append(out.get("scope"))
-        detail = {k: out.get(k) for k in ("path", "scope", "rewrites", "web_searched",
+        detail = {k: out.get(k) for k in ("path", "scope", "rewrites", "revisions",
+                                          "citation_errors", "web_searched",
                                           "web_error", "kept",
                                           "dropped", "usefulness", "usefulness_reason",
                                           "llm_calls", "budget_reached", "tokens",
