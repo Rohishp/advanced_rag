@@ -432,7 +432,7 @@ def check_support(state: State) -> State:
                 "support_reason": "The answer states that the information was not found."}
 
     out = support_chain.invoke({"answer": state["answer"], "context": state["context"]})
-    
+
     return {"support": out.support, "evidence": out.evidence,
             "support_reason": out.explanation}
 
@@ -584,9 +584,9 @@ web_query_prompt = ChatPromptTemplate.from_messages(
             "(e.g. 'today', 'this week', 'last month'). Words like 'latest' or "
             "'current' alone do not justify a filter, because the latest event may be "
             "months old. Otherwise leave it null.\n"
-            "- Do NOT answer the question."
             "- For questions about the latest or most recent event, add the current "
-            "year so results focus on the newest edition or season.\n",
+            "year so results focus on the newest edition or season.\n"
+            "- Do NOT answer the question.",
         ),
         ("human", "Question: {question}"),
     ]
