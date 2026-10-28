@@ -25,6 +25,7 @@ Metrics (higher is better, except llm_calls and latency_s):
 import argparse
 import inspect
 import json
+import logging
 import os
 import statistics
 import sys
@@ -51,9 +52,12 @@ from langsmith import Client, evaluate, tracing_context
 
 # ---------- Local ----------
 import self_rag
-from rag_common import CorpusConfig, PdfIndex, chat_model
+from rag_common import CorpusConfig, PdfIndex, chat_model, setup_logging
 
 load_dotenv()
+
+# Status and progress go to the log; the results table is printed.
+log = logging.getLogger("rag.eval")
 
 # Judge: stronger than the pipeline's model. Defaults chosen in step 6 (decision S6.11).
 EVAL_MODEL = os.getenv("EVAL_MODEL", "gpt-6.1-sol")
@@ -116,8 +120,8 @@ def sync_dataset(client: Client, name: str, cases: List[dict]) -> None:
             updated += 1
     for ex in existing.values():            # cases removed from eval.yaml
         client.delete_example(ex.id)
-    print(f"Dataset '{name}': {len(cases)} cases "
-          f"({created} created, {updated} updated, {len(existing)} deleted)")
+    log.info("Dataset '%s': %d cases (%d created, %d updated, %d deleted)",
+             name, len(cases), created, updated, len(existing))
 
 
 # ======================================================================
@@ -157,7 +161,7 @@ class LlmCallCounter(BaseCallbackHandler):
 
 def load_prices(path: Path) -> Dict[str, Dict[str, float]]:
     if not path.is_file():
-        print(f"No price table at {path}: cost_per_1k will be empty.")
+        log.warning("No price table at %s: cost_per_1k will be empty.", path)
         return {}
     return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("models") or {}
 
@@ -404,7 +408,8 @@ def run_local(target, cases: List[dict], args) -> tuple:
     """
     experiment = f"{args.prefix}-{uuid.uuid4().hex[:8]}"   # same form as LangSmith's names
     jobs = [(c, rep) for rep in range(args.reps) for c in cases]
-    print(f"Local eval '{experiment}': {len(cases)} cases x {args.reps} reps, LangSmith off")
+    log.info("Local eval '%s': %d cases x %d reps, LangSmith off",
+             experiment, len(cases), args.reps)
 
     def one(case: dict, rep: int) -> dict:
         inputs = {"question": case["question"]}
@@ -430,9 +435,11 @@ def run_local(target, cases: List[dict], args) -> tuple:
         for done, f in enumerate(as_completed(futures), 1):
             row = f.result()
             scores = {r["key"]: r["score"] for r in row["results"]}
-            print(f"[{done}/{len(jobs)}] {row['case_id']} (rep {row['rep'] + 1}): "
-                  f"path {row['outputs'].get('path')}, correctness {scores.get('correctness')}"
-                  + (f", {row['outputs']['error']}" if row["outputs"].get("error") else ""))
+            error = row["outputs"].get("error")
+            (log.warning if error else log.info)(
+                "[%d/%d] %s (rep %d): path %s, correctness %s%s", done, len(jobs),
+                row["case_id"], row["rep"] + 1, row["outputs"].get("path"),
+                scores.get("correctness"), f", {error}" if error else "")
             rows.append(row)
     rows.sort(key=lambda r: (r["case_id"], r["rep"]))
     return experiment, rows
@@ -520,6 +527,7 @@ def main(argv=None) -> None:
     parser.add_argument("--local", action="store_true",
                         help="run without LangSmith (no dataset sync, no uploads, tracing off)")
     args = parser.parse_args(argv)
+    setup_logging()
 
     if not args.local and not os.getenv("LANGSMITH_API_KEY"):
         sys.exit("LANGSMITH_API_KEY is not set (.env). Use --local to run without LangSmith.")

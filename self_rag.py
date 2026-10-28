@@ -17,6 +17,7 @@ import argparse
 import contextvars
 import hashlib
 import json
+import logging
 import os
 import re
 import sys
@@ -42,9 +43,13 @@ from tavily.errors import TimeoutError as TavilyTimeout, UsageLimitExceededError
 
 # ---------- Local ----------
 from rag_common import (CorpusConfig, PdfIndex, api_setting, call_with_retries, chat_model,
-                        embedding_model, init_corpus, load_pdf)
+                        embedding_model, init_corpus, load_pdf, setup_logging)
 
 load_dotenv()
+
+# A fixed name, not __name__ ('__main__' when run as a script); 'rag.*' is set by
+# setup_logging(). Status goes to the log; answers are printed (print_result).
+log = logging.getLogger("rag.self_rag")
 
 
 # ======================================================================
@@ -808,7 +813,7 @@ def refresh_kb_description(index: PdfIndex) -> None:
     description = generate_kb_description(index)
     cache.write_text(json.dumps({"index_state": state, "description": description},
                                 indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"Generated KB description: {description}")
+    log.info("Generated KB description: %s", description)
 
 
 def kb_description_for(index: PdfIndex) -> str:
@@ -843,15 +848,17 @@ def parse_args(argv=None) -> argparse.Namespace:
 def report_tracing() -> None:
     """One line on whether LangSmith tracing is active (it is configured only via .env)."""
     if os.getenv("LANGSMITH_TRACING", "").strip().lower() != "true":
-        print("LangSmith tracing: off (set LANGSMITH_TRACING=true in .env)")
+        log.info("LangSmith tracing: off (set LANGSMITH_TRACING=true in .env)")
     elif not os.getenv("LANGSMITH_API_KEY"):
-        print("LangSmith tracing: LANGSMITH_TRACING is true but LANGSMITH_API_KEY is missing")
+        log.warning("LangSmith tracing: LANGSMITH_TRACING is true but LANGSMITH_API_KEY "
+                    "is missing")
     else:
-        print(f"LangSmith tracing: on, project '{os.getenv('LANGSMITH_PROJECT', 'default')}'")
+        log.info("LangSmith tracing: on, project '%s'", os.getenv("LANGSMITH_PROJECT", "default"))
 
 
 def main(argv=None) -> None:
     args = parse_args(argv)
+    setup_logging()
     if args.command == "init":
         config = init_corpus(args.corpus)
         print(f"Created {config} and {config.parent / 'docs'}: add PDFs, then run index.")

@@ -19,7 +19,23 @@ from langchain_core.embeddings import Embeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("rag.common")
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+def setup_logging() -> None:
+    """For the CLIs: the project's loggers ('rag.*') at LOG_LEVEL (.env, default INFO),
+    everything else at WARNING (httpx and openai log every request at INFO).
+
+    Logs go to stderr; the CLIs print their results (answers, eval tables) to stdout.
+    """
+    name = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
+    level = logging.getLevelName(name)
+    if not isinstance(level, int):
+        raise ValueError(f"LOG_LEVEL={name!r}: expected DEBUG, INFO, WARNING or ERROR")
+    logging.basicConfig(level=logging.WARNING, format=LOG_FORMAT, datefmt="%H:%M:%S")
+    logging.getLogger("rag").setLevel(level)
 
 INDEX_BATCH = 500  # max IDs per Chroma add/delete call
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
@@ -379,12 +395,12 @@ class PdfIndex:
             self.delete(self.source_ids(name))
             del manifest[name]
             self._save_manifest(manifest)
-            print(f"{name}: removed from folder, chunks deleted")
+            log.info("%s: removed from folder, chunks deleted", name)
 
         for pdf in pdfs:
             fingerprint = self.fingerprint(pdf)
             if manifest.get(pdf.name) == fingerprint:
-                print(f"{pdf.name}: unchanged, skipped")
+                log.info("%s: unchanged, skipped", pdf.name)
                 continue
 
             chunks = self.chunk(load_pdf(pdf, self.cfg.text_fixes))
@@ -402,13 +418,13 @@ class PdfIndex:
                 batch = new_ids[start:start + INDEX_BATCH]
                 self.store.add_documents([unique[i] for i in batch], ids=batch)
 
-            print(f"{pdf.name}: {len(chunks)} chunks, {len(unique)} unique, "
-                  f"{len(new_ids)} newly embedded, {len(stale)} stale removed")
+            log.info("%s: %d chunks, %d unique, %d newly embedded, %d stale removed",
+                     pdf.name, len(chunks), len(unique), len(new_ids), len(stale))
 
             manifest[pdf.name] = fingerprint   # save after each PDF to keep progress
             self._save_manifest(manifest)
 
-        print(f"Collection '{self.cfg.collection}': {self.count()} chunks in total")
+        log.info("Collection '%s': %d chunks in total", self.cfg.collection, self.count())
 
 
 def init_corpus(folder: Union[str, Path]) -> Path:
