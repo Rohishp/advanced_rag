@@ -210,6 +210,7 @@ def make_target(index: PdfIndex):
             log.warning("%r: pipeline counted %s LLM calls, callback counted %d",
                         inputs["question"], res.get("llm_calls", 0), counter.calls)
         grounded = path in ("docs", "web")
+        kept = [self_rag.source_label(d) for d in res.get("relevant_docs", [])]
         return {
             "answer": res.get("answer", ""),
             "path": path,
@@ -217,9 +218,14 @@ def make_target(index: PdfIndex):
             "context": res.get("context", "") if grounded else "",
             "sources": [self_rag.source_label(d) for d in res.get("relevant_docs", [])]
                        if grounded else [],
-            "kept": [self_rag.source_label(d) for d in res.get("relevant_docs", [])],
+            "kept": kept,
+            # by label: a refined source is a new Document with the same label
             "dropped": [self_rag.source_label(d) for d in res.get("docs", [])
-                        if d not in res.get("relevant_docs", [])],
+                        if self_rag.source_label(d) not in kept],
+            "refined": [f"{self_rag.source_label(d)}: {d.metadata['passages']} passages, "
+                        f"{d.metadata['original_chars']} -> {len(d.page_content)} chars"
+                        for d in res.get("relevant_docs", []) if d.metadata.get("passages")],
+            "context_chars": len(res.get("context", "")),
             "support": res.get("support"),
             "usefulness": res.get("usefulness"),
             "usefulness_reason": res.get("usefulness_reason", ""),
@@ -474,7 +480,8 @@ def summarize(rows: List[dict], experiment: str, corpus: str, reps: int, mode: s
         detail = {k: out.get(k) for k in ("path", "scope", "rewrites", "revisions",
                                           "citation_errors", "web_searched",
                                           "web_error", "kept",
-                                          "dropped", "usefulness", "usefulness_reason",
+                                          "dropped", "refined", "context_chars",
+                                          "usefulness", "usefulness_reason",
                                           "llm_calls", "budget_reached", "tokens",
                                           "cost_usd")}
         detail["answer"] = (out.get("answer") or "")[:600]
