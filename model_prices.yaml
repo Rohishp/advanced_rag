@@ -1,0 +1,12 @@
+# USD per 1M tokens, used by eval_self_rag.py for the cost_per_1k metric.
+# Checked 2026-10-28: benchlm.ai/openai/api-pricing; VentureBeat (GPT-6 Sol/Luna, 22 Sep 2026).
+# API responses may carry a dated model name; the longest matching prefix wins.
+# Cached-input discounts are ignored, so costs are an upper bound.
+models:
+  gpt-6-astra:   {input: 10.00, output: 50.00}
+  gpt-6.1-sol:   {input: 2.00,  output: 10.00}
+  gpt-6.1-terra: {input: 1.00,  output: 5.00}
+  gpt-6-sol:     {input: 2.00,  output: 10.00}
+  gpt-6-luna:    {input: 0.10,  output: 0.50}
+  gpt-5.4:       {input: 2.50,  output: 15.00}
+  gpt-5.4-mini:  {input: 0.75,  output: 4.50}

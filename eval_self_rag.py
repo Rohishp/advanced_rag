@@ -13,6 +13,7 @@ Metrics (higher is better, except llm_calls and latency_s):
     citations    share of cited labels that exist in the context (deterministic)
     path_match   direct / docs / web / no_answer as expected (deterministic)
     llm_calls    LLM calls made by the pipeline for the question
+    cost_per_1k  pipeline cost in USD per 1000 such questions (prices: model_prices.yaml)
     latency_s    wall-clock seconds per question
 """
 
@@ -51,7 +52,9 @@ load_dotenv()
 EVAL_MODEL = os.getenv("EVAL_MODEL", "gpt-5.4")   # judge; stronger than the pipeline's model
 EVAL_REASONING_EFFORT = os.getenv("EVAL_REASONING_EFFORT") or None
 RESULTS_DIR = Path("eval_results")
-METRICS = ["correctness", "faithfulness", "citations", "path_match", "llm_calls", "latency_s"]
+METRICS = ["correctness", "faithfulness", "citations", "path_match", "llm_calls",
+           "cost_per_1k", "latency_s"]
+PRICES_FILE = Path(os.getenv("MODEL_PRICES", "model_prices.yaml"))
 
 judge = chat_model(EVAL_MODEL, EVAL_REASONING_EFFORT)
 
@@ -106,10 +109,11 @@ def sync_dataset(client: Client, name: str, cases: List[dict]) -> None:
 # TARGET (one pipeline run per case)
 # ======================================================================
 class LlmCallCounter(BaseCallbackHandler):
-    """Counts chat-model and LLM calls, including those inside .batch()."""
+    """Counts LLM calls and their token usage per model (thread-safe)."""
 
     def __init__(self):
         self.calls = 0
+        self.tokens: Dict[str, Dict[str, int]] = defaultdict(lambda: {"input": 0, "output": 0})
         self._lock = threading.Lock()
 
     def _count(self):
@@ -122,6 +126,44 @@ class LlmCallCounter(BaseCallbackHandler):
     def on_llm_start(self, *args, **kwargs):
         self._count()
 
+    def on_llm_end(self, response, **kwargs):
+        for generations in response.generations:
+            for gen in generations:
+                message = getattr(gen, "message", None)
+                usage = getattr(message, "usage_metadata", None) or {}
+                if not usage:
+                    continue
+                model = ((getattr(message, "response_metadata", None) or {}).get("model_name")
+                         or (response.llm_output or {}).get("model_name") or "unknown")
+                with self._lock:
+                    self.tokens[model]["input"] += usage.get("input_tokens", 0)
+                    self.tokens[model]["output"] += usage.get("output_tokens", 0)
+
+
+def load_prices(path: Path) -> Dict[str, Dict[str, float]]:
+    if not path.is_file():
+        print(f"No price table at {path}: cost_per_1k will be empty.")
+        return {}
+    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("models") or {}
+
+
+def price_for(model: str, prices: Dict[str, Dict[str, float]]) -> Optional[Dict[str, float]]:
+    """Longest prefix match, so dated API names (e.g. '<model>-2026-09-22') still match."""
+    matches = [name for name in prices if model.startswith(name)]
+    return prices[max(matches, key=len)] if matches else None
+
+
+def cost_usd(tokens: Dict[str, Dict[str, int]], prices) -> tuple:
+    """(total USD or None if any model is unpriced, list of unpriced models)."""
+    total, unpriced = 0.0, []
+    for model, t in tokens.items():
+        price = price_for(model, prices)
+        if price is None:
+            unpriced.append(model)
+            continue
+        total += (t["input"] * price["input"] + t["output"] * price["output"]) / 1_000_000
+    return (None if unpriced else total), unpriced
+
 
 # Registered like LangChain's own usage tracker: every callback manager created while the
 # variable is set picks the counter up, so it never has to be passed in the invoke config
@@ -131,6 +173,7 @@ register_configure_hook(_call_counter, inheritable=True)
 
 
 def make_target(index: PdfIndex):
+    prices = load_prices(PRICES_FILE)
     app = self_rag.build_graph()
     base_config = self_rag.run_config(index, self_rag.kb_description_for(index))
 
@@ -143,6 +186,7 @@ def make_target(index: PdfIndex):
         finally:
             _call_counter.reset(token)
         path = self_rag.answer_path(res)
+        cost, unpriced = cost_usd(counter.tokens, prices)
         grounded = path in ("docs", "web")
         return {
             "answer": res.get("answer", ""),
@@ -161,6 +205,9 @@ def make_target(index: PdfIndex):
             "revisions": res.get("revisions", 0),
             "web_searched": bool(res.get("web_searched")),
             "llm_calls": counter.calls,
+            "tokens": {m: dict(t) for m, t in counter.tokens.items()},
+            "cost_usd": cost,
+            "unpriced_models": unpriced,
             "latency_s": round(time.perf_counter() - start, 2),
         }
 
@@ -284,11 +331,19 @@ def llm_calls(outputs: dict) -> dict:
     return {"key": "llm_calls", "score": outputs["llm_calls"]}
 
 
+def cost_per_1k(outputs: dict) -> dict:
+    if outputs.get("cost_usd") is None:
+        return {"key": "cost_per_1k", "score": None,
+                "comment": f"unpriced models: {outputs.get('unpriced_models')}"}
+    return {"key": "cost_per_1k", "score": round(outputs["cost_usd"] * 1000, 3)}
+
+
 def latency_s(outputs: dict) -> dict:
     return {"key": "latency_s", "score": outputs["latency_s"]}
 
 
-EVALUATORS = [correctness, faithfulness, citations, path_match, llm_calls, latency_s]
+EVALUATORS = [correctness, faithfulness, citations, path_match, llm_calls, cost_per_1k,
+              latency_s]
 
 
 # ======================================================================
@@ -313,7 +368,7 @@ def summarize(results, experiment: str, corpus: str, reps: int) -> dict:
         scopes[case_id].append(out.get("scope"))
         detail = {k: out.get(k) for k in ("path", "scope", "rewrites", "web_searched", "kept",
                                           "dropped", "usefulness", "usefulness_reason",
-                                          "llm_calls")}
+                                          "llm_calls", "tokens", "cost_usd")}
         detail["answer"] = out.get("answer", "")[:600]
         detail["comments"] = {}
         for r in row["evaluation_results"]["results"]:
@@ -351,7 +406,8 @@ def print_summary(summary: dict, baseline: Optional[dict] = None) -> None:
     print("-" * len(head))
     print(f"{'OVERALL':28}" + "".join(f"{fmt(summary['overall'][m]):>12}" for m in METRICS))
     if baseline:
-        print(f"{'BASELINE':28}" + "".join(f"{fmt(baseline['overall'][m]):>12}" for m in METRICS)
+        print(f"{'BASELINE':28}"
+              + "".join(f"{fmt(baseline['overall'].get(m)):>12}" for m in METRICS)
               + f"   ({baseline['experiment']})")
 
 
