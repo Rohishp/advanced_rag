@@ -10,7 +10,7 @@ _fake = FakeListChatModel(responses=["x"] * 100000)
 
 # Scripted behaviour; tests change these between runs (reset() restores the defaults).
 DEFAULTS = {"scope": "knowledge_base", "keep": True, "support": "fully_supported",
-            "useful": "useful", "cite": None, "passages": [1]}
+            "useful": "useful", "cite": None}
 S = dict(DEFAULTS)
 INTERNAL_DOCS = [Document(page_content=f"chunk {i}", metadata={"source": "a.pdf", "page": i})
                  for i in range(4)]
@@ -36,11 +36,6 @@ def _grade(x):
     return sr.RelevanceGrade(question_entity="none", same_entity=keep, on_topic=keep)
 
 
-def _grade_passages(x):
-    g = _grade(x)
-    return sr.RelevancePassages(**g.model_dump(), passages=list(S["passages"]))
-
-
 def _answer(x):
     label = S["cite"] or x["context"].split("]")[0][1:]
     return AIMessage(content=f"Answer [{label}]")
@@ -50,7 +45,6 @@ def install():
     sr.decide_retrieval_chain = _chain(lambda x: sr.ScopeDecision(reason="r", scope=S["scope"]))
     sr.direct_chain = _chain(lambda x: AIMessage(content="direct answer"))
     sr.relevance_chain = _chain(_grade)
-    sr.relevance_passages_chain = _chain(_grade_passages)
     sr.generate_chain = _chain(_answer)
     sr.revise_chain = _chain(_answer)
     sr.support_chain = _chain(lambda x: sr.SupportCheck(evidence=[], explanation="e",

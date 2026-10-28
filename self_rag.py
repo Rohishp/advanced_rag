@@ -82,26 +82,6 @@ except ValueError:
 if MAX_LLM_CALLS < 1:
     raise ValueError(f"MAX_LLM_CALLS={MAX_LLM_CALLS}: must be at least 1")
 
-# Refinement (CRAG's knowledge refinement, plan Step 11): a source longer than
-# REFINE_MIN_CHARS (.env; 0 turns it off) is graded as numbered passages of up to
-# PASSAGE_CHARS, and only the passages the grader picks reach generate. Shorter sources (all
-# PDF chunks at the default chunk size) are graded and used whole, as before.
-def _int_setting(name: str, default: int, minimum: int) -> int:
-    raw = os.getenv(name)
-    try:
-        value = int(raw) if raw not in (None, "") else default
-    except ValueError:
-        raise ValueError(f"{name}={raw!r}: expected an integer") from None
-    if value < minimum:
-        raise ValueError(f"{name}={value}: must be at least {minimum}")
-    return value
-
-
-# Default 3000 chars (about 750 tokens): PDF chunks stay below it (largest measured: 388
-# tokens), web pages are far above it (about 1,100-3,400 tokens; decisions S11.3, S11.12).
-REFINE_MIN_CHARS = _int_setting("REFINE_MIN_CHARS", 3000, 0)
-PASSAGE_CHARS = _int_setting("PASSAGE_CHARS", 400, 50)         # about 100 tokens
-
 NO_ANSWER = "I couldn't find this in the available sources."
 GRAPH_PNG = "self_rag_graph.png"
 KB_DESCRIPTION_FILE = "kb_description.json"   # cache in the corpus's db_dir
@@ -168,8 +148,6 @@ def run_config(index: PdfIndex, kb_description: str) -> RunnableConfig:
             "embed_model": EMBED_MODEL,
             "retriever_k": cfg.retriever_k,
             "max_llm_calls": MAX_LLM_CALLS,
-            "refine_min_chars": REFINE_MIN_CHARS,
-            "passage_chars": PASSAGE_CHARS,
             "chunk_size": cfg.chunk_size,
             "chunk_overlap": cfg.chunk_overlap,
             "kb_description_source": "config" if cfg.kb_description else "generated",
@@ -183,17 +161,17 @@ def run_config(index: PdfIndex, kb_description: str) -> RunnableConfig:
     }
 
 
-def invoke_parallel(calls: List[Tuple[object, dict]], config: RunnableConfig) -> list:
-    """(chain, input) pairs invoked in parallel threads, traced as children of the node.
+def invoke_parallel(chain, inputs: List[dict], config: RunnableConfig) -> list:
+    """chain.invoke over all inputs in parallel threads, traced as children of the node.
 
     Used instead of chain.batch(): under LangSmith evaluate(), batch() loses track of its
     runs (TracerException 'No indexed run ID'); plain invokes with the node's config do not.
     """
-    if not calls:
+    if not inputs:
         return []
-    with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENCY, len(calls))) as pool:
+    with ThreadPoolExecutor(max_workers=min(MAX_CONCURRENCY, len(inputs))) as pool:
         futures = [pool.submit(contextvars.copy_context().run, chain.invoke, x, config)
-                   for chain, x in calls]
+                   for x in inputs]
         return [f.result() for f in futures]
 
 
@@ -227,7 +205,7 @@ class State(TypedDict, total=False):
     # retrieve, web_search
     docs: List[Document]
     # grade_documents
-    relevant_docs: List[Document]          # long sources as refined copies (same label)
+    relevant_docs: List[Document]
     # generate, generate_direct, revise_answer, label_citations, no_answer
     context: str                           # sources as [S1], [S2], ... (format_context)
     answer: str                            # cites ids until label_citations maps them
@@ -323,132 +301,41 @@ class RelevanceGrade(BaseModel):
     )
 
 
-RELEVANCE_SYSTEM = (
-    "Judge whether a text can help answer a question.\n"
-    "The knowledge base contains {kb_description}. A text whose source is a file comes "
-    "from it and is about the knowledge base's own organization unless it says "
-    "otherwise. A text whose source starts with 'web:' comes from a web search.\n"
-    "1. question_entity: the organization or person the question is about. If it "
-    "asks about a product, plan, policy or role, name the organization it belongs "
-    "to. 'none' if it is about no specific one.\n"
-    "2. same_entity: the text is about that organization or person, including any of "
-    "its own products, plans, people and policies. A different entity with a similar "
-    "or overlapping name (e.g. 'Acme Labs' vs 'Acme Systems') is not the same. A web "
-    "text counts only if it names the entity.\n"
-    "3. on_topic: the text has information for at least one part of the question; "
-    "it need not answer all of it.\n"
-)
-
 relevance_chain = ChatPromptTemplate.from_messages(
     [
-        ("system", RELEVANCE_SYSTEM + CONTEXT_IS_DATA),
+        (
+            "system",
+            "Judge whether a text can help answer a question.\n"
+            "The knowledge base contains {kb_description}. A text whose source is a file comes "
+            "from it and is about the knowledge base's own organization unless it says "
+            "otherwise. A text whose source starts with 'web:' comes from a web search.\n"
+            "1. question_entity: the organization or person the question is about. If it "
+            "asks about a product, plan, policy or role, name the organization it belongs "
+            "to. 'none' if it is about no specific one.\n"
+            "2. same_entity: the text is about that organization or person, including any of "
+            "its own products, plans, people and policies. A different entity with a similar "
+            "or overlapping name (e.g. 'Acme Labs' vs 'Acme Systems') is not the same. A web "
+            "text counts only if it names the entity.\n"
+            "3. on_topic: the text has information for at least one part of the question; "
+            "it need not answer all of it.\n" + CONTEXT_IS_DATA,
+        ),
         ("human", "Question: {question}\n\nSource: {source}\nText:\n{chunk}"),
     ]
 ) | llm.with_structured_output(RelevanceGrade)
 
 
-# Long sources (over REFINE_MIN_CHARS): the same judgement, plus which passages to keep.
-class RelevancePassages(RelevanceGrade):
-    passages: List[int] = Field(
-        description="Numbers of the passages with information for any part of the question."
-    )
-
-
-relevance_passages_chain = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            RELEVANCE_SYSTEM
-            + "4. passages: the text is split into numbered passages (#1, #2, ...). List the "
-            "numbers of every passage with information for any part of the question, "
-            "including passages needed to understand them. Empty if none.\n"
-            + CONTEXT_IS_DATA,
-        ),
-        ("human", "Question: {question}\n\nSource: {source}\nText:\n{chunk}"),
-    ]
-) | llm.with_structured_output(RelevancePassages)
-
-
-def _pieces(line: str, max_chars: int) -> List[str]:
-    """Sentences of a line; a sentence longer than max_chars (e.g. a table row or a list
-    without full stops) is cut at spaces. A single longer word stays whole."""
-    pieces = []
-    for sentence in (x for x in re.split(r"(?<=[.!?])\s+", line.strip()) if x):
-        while len(sentence) > max_chars:
-            cut = sentence.rfind(" ", 0, max_chars + 1)
-            if cut <= 0:
-                break
-            pieces.append(sentence[:cut])
-            sentence = sentence[cut + 1:].lstrip()
-        if sentence:
-            pieces.append(sentence)
-    return pieces
-
-
-def split_passages(text: str, max_chars: int = None) -> List[str]:
-    """Consecutive sentences joined into passages of up to max_chars (PASSAGE_CHARS); line
-    breaks are kept. Only a single word longer than max_chars makes a longer passage."""
-    max_chars = max_chars or PASSAGE_CHARS
-    passages, current = [], ""
-    for line in text.splitlines():
-        sentences = _pieces(line, max_chars)
-        for i, sentence in enumerate(sentences):
-            sep = " " if i else "\n"
-            if current and len(current) + len(sep) + len(sentence) > max_chars:
-                passages.append(current)
-                current = sentence
-            else:
-                current = current + sep + sentence if current else sentence
-    if current:
-        passages.append(current)
-    return passages
-
-
-def needs_refining(doc: Document) -> bool:
-    return REFINE_MIN_CHARS > 0 and len(doc.page_content) > REFINE_MIN_CHARS
-
-
-def numbered(passages: List[str]) -> str:
-    return "\n".join(f"#{i}: {p}" for i, p in enumerate(passages, 1))
-
-
-def refined(doc: Document, passages: List[str], picked: List[int]) -> Document:
-    """The picked passages, verbatim and in order; '…' marks left-out text. If the grader
-    kept the source but picked no valid passage, the source is used whole."""
-    keep = sorted({i for i in picked if 1 <= i <= len(passages)})
-    if not keep:
-        return doc
-    parts = []
-    for n, i in enumerate(keep):
-        if (n == 0 and i > 1) or (n > 0 and i > keep[n - 1] + 1):   # a gap before it
-            parts.append("…")
-        parts.append(passages[i - 1])
-    if keep[-1] < len(passages):
-        parts.append("…")
-    meta = {**doc.metadata, "passages": f"{len(keep)}/{len(passages)}",
-            "original_chars": len(doc.page_content)}
-    return Document(page_content="\n".join(parts), metadata=meta)
-
-
 def grade_documents(state: State, config: RunnableConfig) -> State:
-    """Grade all sources in parallel; keep those about the right entity and topic.
-
-    Long sources are graded as numbered passages and only the picked passages are kept
-    (refinement); still one LLM call per source.
-    """
+    """Grade all chunks in parallel; keep those about the right entity and topic."""
     docs = state.get("docs", [])
     kb_description = corpus_context(config)["kb_description"]
-    passages = [split_passages(d.page_content) if needs_refining(d) else None for d in docs]
-    calls = [
-        (relevance_passages_chain if p else relevance_chain,
-         {"question": state["question"], "source": source_label(d),
-          "chunk": numbered(p) if p else d.page_content, "kb_description": kb_description})
-        for d, p in zip(docs, passages)
-    ]
-    grades = invoke_parallel(calls, config)
+    grades = invoke_parallel(
+        relevance_chain,
+        [{"question": state["question"], "source": source_label(d), "chunk": d.page_content,
+          "kb_description": kb_description} for d in docs],
+        config,
+    )
     return {"llm_calls": len(docs),
-            "relevant_docs": [refined(d, p, g.passages) if p else d
-                              for d, p, g in zip(docs, passages, grades)
+            "relevant_docs": [d for d, g in zip(docs, grades)
                               if g.same_entity and g.on_topic]}
 
 
@@ -985,11 +872,9 @@ def print_result(res: State) -> None:
     if res.get("docs"):
         relevant = res.get("relevant_docs", [])
         print(f"\nSOURCES ({len(relevant)}/{len(res['docs'])} relevant):")
-        kept = {source_label(r): (sid, r) for sid, r in source_ids(relevant)}
+        ids = source_ids(relevant)
         for d in res["docs"]:
-            sid, r = kept.get(source_label(d), (None, None))
-            mark = "drop" if sid is None else f"keep {sid}" + (
-                f", {r.metadata['passages']} passages" if r.metadata.get("passages") else "")
+            mark = next((f"keep {sid}" for sid, r in ids if r == d), "drop")
             print(f"  [{mark}] {source_label(d)}: {d.page_content[:80].replace(chr(10), ' ')}")
 
     if res.get("citation_errors"):
