@@ -107,7 +107,8 @@ class State(TypedDict, total=False):
     """Data flowing through the graph; each node returns only what it changes."""
     question: str
     # decide_retrieval
-    need_retrieval: bool
+    scope: Literal["general", "knowledge_base", "external"]
+    need_retrieval: bool                   # scope != "general"
     # rewrite_question
     retrieval_query: str
     rewrites: int
@@ -137,26 +138,30 @@ class State(TypedDict, total=False):
 # NODES (in execution order)
 # ======================================================================
 
-# ---------- Node: DECIDE whether retrieval is needed ----------
-class RetrieveDecision(BaseModel):
-    should_retrieve: bool = Field(
-        description="True if the question needs the knowledge base or up-to-date sources."
-    )
+# ---------- Node: DECIDE the question's scope (where an answer may come from) ----------
+class ScopeDecision(BaseModel):
+    reason: str = Field(description="One short line.")
+    scope: Literal["general", "knowledge_base", "external"]
 
 
 decide_retrieval_chain = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "Decide whether a question needs retrieval before answering.\n"
+            "Classify the question by where its answer may come from.\n"
             "The knowledge base contains {kb_description}.\n"
-            "Retrieve if the question is about anything the knowledge base covers, or "
-            "needs recent or specific facts you cannot answer reliably. Do not retrieve "
-            "for general, timeless knowledge. If unsure, retrieve.",
+            "- knowledge_base: about anything the knowledge base covers (its organizations, "
+            "people, products, policies or other subjects), including details it may not "
+            "contain.\n"
+            "- external: needs specific or recent facts about things the knowledge base does "
+            "not cover, such as other organizations, current events or recent results.\n"
+            "- general: timeless general knowledge you can answer reliably without sources.\n"
+            "If unsure between knowledge_base and external, choose knowledge_base. If unsure "
+            "whether sources are needed, do not choose general.",
         ),
         ("human", "Question: {question}"),
     ]
-) | llm.with_structured_output(RetrieveDecision)
+) | llm.with_structured_output(ScopeDecision)
 
 
 def decide_retrieval(state: State, config: RunnableConfig) -> State:
@@ -164,7 +169,7 @@ def decide_retrieval(state: State, config: RunnableConfig) -> State:
         {"question": state["question"],
          "kb_description": corpus_context(config)["kb_description"]}
     )
-    return {"need_retrieval": decision.should_retrieve}
+    return {"scope": decision.scope, "need_retrieval": decision.scope != "general"}
 
 
 # ---------- Node: DIRECT answer (no retrieval) ----------
@@ -191,35 +196,51 @@ def retrieve(state: State, config: RunnableConfig) -> State:
     return {"docs": retriever.invoke(state.get("retrieval_query") or state["question"])}
 
 
-# ---------- Node: GRADE retrieved chunks (topic-level, lenient) ----------
+# ---------- Node: GRADE retrieved chunks (same entity AND on topic) ----------
 class RelevanceGrade(BaseModel):
-    is_relevant: bool
+    # the entity is named first so the two checks below refer to it
+    question_entity: str = Field(
+        description="The specific organization, person or product the question is about, "
+                    "or 'none'."
+    )
+    same_entity: bool = Field(
+        description="The text is about that same entity (true if question_entity is 'none')."
+    )
+    on_topic: bool = Field(description="The text discusses the subject the question asks about.")
 
 
 relevance_chain = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "Judge whether a chunk is relevant to a question, at the topic level.\n"
-            "Relevant: it discusses the same entity or topic; it need not contain the "
-            "answer.\n"
-            "Not relevant: a different subject, or a different organization, person or "
-            "product than the one asked about, even with a similar name.\n"
-            "When unsure, it is relevant.",
+            "Judge whether a text can help answer a question.\n"
+            "The knowledge base contains {kb_description}. A text whose source is a file comes "
+            "from it and is about the knowledge base's own organization unless it says "
+            "otherwise. A text whose source starts with 'web:' comes from a web search.\n"
+            "1. question_entity: the specific organization, person or product asked about, "
+            "or 'none'.\n"
+            "2. same_entity: the text is about exactly that entity. A different entity with "
+            "a similar or overlapping name (e.g. 'Acme Labs' vs 'Acme Systems') is not the "
+            "same. A web text counts only if it names the entity.\n"
+            "3. on_topic: the text discusses the subject asked about; it need not contain "
+            "the whole answer.",
         ),
-        ("human", "Question: {question}\n\nChunk:\n{chunk}"),
+        ("human", "Question: {question}\n\nSource: {source}\nText:\n{chunk}"),
     ]
 ) | llm.with_structured_output(RelevanceGrade)
 
 
-def grade_documents(state: State) -> State:
-    """Grade all chunks in parallel; keep the relevant ones."""
+def grade_documents(state: State, config: RunnableConfig) -> State:
+    """Grade all chunks in parallel; keep those about the right entity and topic."""
     docs = state.get("docs", [])
+    kb_description = corpus_context(config)["kb_description"]
     grades = relevance_chain.batch(
-        [{"question": state["question"], "chunk": d.page_content} for d in docs],
+        [{"question": state["question"], "source": source_label(d), "chunk": d.page_content,
+          "kb_description": kb_description} for d in docs],
         config={"max_concurrency": MAX_CONCURRENCY},
     )
-    return {"relevant_docs": [d for d, g in zip(docs, grades) if g.is_relevant]}
+    return {"relevant_docs": [d for d, g in zip(docs, grades)
+                              if g.same_entity and g.on_topic]}
 
 
 # ---------- Node: GENERATE from relevant chunks ----------
@@ -348,8 +369,9 @@ usefulness_chain = ChatPromptTemplate.from_messages(
             "Judge whether the ANSWER gives the user what the QUESTION asks for.\n"
             "- useful: it provides the requested information, even if it notes a "
             "limitation.\n"
-            "- not_useful: it says the information was not found (in any wording), or "
-            "it is generic or off-topic.\n"
+            "- not_useful: it says the information was not found (in any wording); it is "
+            "generic or off-topic; or it answers about a different organization, person or "
+            "product than the one asked about (e.g. a similarly named company).\n"
             "Do not judge correctness; that was checked before.",
         ),
         ("human", "Question: {question}\n\nAnswer:\n{answer}"),
@@ -458,13 +480,20 @@ def no_answer(state: State) -> State:
 # ROUTING
 # ======================================================================
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
-    return "retrieve" if state["need_retrieval"] else "generate_direct"
+    return "generate_direct" if state["scope"] == "general" else "retrieve"
 
 
 def next_attempt(state: State) -> Literal["rewrite_question", "rewrite_web_query", "no_answer"]:
-    """Internal rewrites first, then one web search, then give up."""
-    if state.get("rewrites", 0) < MAX_REWRITES:
-        return "rewrite_question"
+    """What to try after a failed pass, by scope.
+
+    knowledge_base: rewritten internal searches only; the web is no authority on the
+                    knowledge base's own organization, so not found means not found.
+    external:       one web search after the first internal pass, no internal rewrites.
+    """
+    if state.get("scope") == "knowledge_base":
+        if state.get("rewrites", 0) < MAX_REWRITES:
+            return "rewrite_question"
+        return "no_answer"
     if not state.get("web_searched"):
         return "rewrite_web_query"
     return "no_answer"
@@ -496,10 +525,12 @@ def build_graph():
                    -> next attempt                 (not useful)
               -> next attempt                      (no relevant chunks)
 
-    next attempt, in order:
-         rewrite_question -> retrieve                           (up to MAX_REWRITES)
-         rewrite_web_query -> web_search -> grade_documents     (once)
-         no_answer -> END
+    decide_retrieval sets the scope: general -> generate_direct; otherwise retrieve.
+
+    next attempt, by scope (see next_attempt):
+         knowledge_base: rewrite_question -> retrieve (up to MAX_REWRITES), then no_answer
+         external:       rewrite_web_query -> web_search -> grade_documents (once),
+                         then no_answer
     """
     g = StateGraph(State)
     for name, node in [
@@ -564,7 +595,7 @@ def answer_path(res: State) -> Literal["direct", "docs", "web", "no_answer"]:
 def print_result(res: State) -> None:
     print("=" * 100)
     print("QUESTION:", res["question"])
-    print("NEED RETRIEVAL:", res.get("need_retrieval"))
+    print("SCOPE:", res.get("scope"))
     print("PATH:", answer_path(res))
     if res.get("rewrites"):
         print(f"REWRITES: {res['rewrites']}/{MAX_REWRITES} (last query: {res['retrieval_query']})")
