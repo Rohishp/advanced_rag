@@ -1,0 +1,150 @@
+# Eval cases for self_rag.py:  python eval_self_rag.py --corpus corpora/nexaai
+# expected_path: direct | docs | web | no_answer
+# facts: what a correct answer must state (judged semantically, not by exact text).
+# The id is stable: changing a case updates it in LangSmith instead of creating a new one.
+cases:
+  # ---------- general knowledge: no retrieval ----------
+  - id: direct-ml
+    question: What is machine learning?
+    expected_path: direct
+    facts:
+      - Machine learning lets computers learn patterns from data instead of being explicitly programmed
+    tags: [direct]
+
+  - id: direct-http
+    question: What does HTTP stand for?
+    expected_path: direct
+    facts:
+      - HTTP stands for Hypertext Transfer Protocol
+    tags: [direct]
+
+  # ---------- single facts from the documents ----------
+  - id: annual-leave
+    question: How many days of annual leave do employees get?
+    expected_path: docs
+    facts:
+      - 18 working days of annual leave per year
+    tags: [single-fact]
+
+  - id: leave-carry-forward
+    question: How much unused annual leave can be carried forward?
+    expected_path: docs
+    facts:
+      - Up to 30 days of unused annual leave can be carried forward
+    tags: [single-fact]
+
+  - id: growth-price
+    question: What does the Growth plan cost per user?
+    expected_path: docs
+    facts:
+      - The Growth plan costs ₹5,999 per user per month
+    tags: [single-fact, text-fix]
+
+  - id: starter-queries
+    question: How many queries per month does the Starter plan include?
+    expected_path: docs
+    facts:
+      - The Starter plan includes up to 5,000 queries per month
+    tags: [single-fact]
+
+  - id: annual-billing-discount
+    question: Is there a discount for annual billing?
+    expected_path: docs
+    facts:
+      - Annual billing offers a 15% discount
+    tags: [single-fact, split-section]
+
+  - id: ceo
+    question: Who is the CEO of NexaAI?
+    expected_path: docs
+    facts:
+      - Aarav Mehta is the CEO (and founder)
+    tags: [single-fact]
+
+  - id: cto
+    question: Who is NexaAI's CTO and what is their background?
+    expected_path: docs
+    facts:
+      - Riya Kapoor is the CTO
+      - Her area is distributed systems and AI platforms
+    tags: [single-fact]
+
+  - id: hq-founded
+    question: Where is NexaAI headquartered and when was it founded?
+    expected_path: docs
+    facts:
+      - Headquartered in Bengaluru, India
+      - Founded in 2021
+    tags: [multi-fact]
+
+  # ---------- lists and facts spread over chunks ----------
+  - id: leave-types
+    question: What types of leave do employees get, and how many days for each?
+    expected_path: docs
+    facts:
+      - Annual leave, 18 working days per year
+      - Sick leave, 10 working days per year
+      - Casual leave, 6 working days per year
+      - Maternity leave as per statutory norms
+    tags: [list]
+
+  - id: core-values
+    question: What are NexaAI's core values?
+    expected_path: docs
+    facts:
+      - Customer Obsession
+      - Transparency
+      - Accountability
+      - Security First
+      - Continuous Improvement
+    tags: [list, split-chunks]
+
+  - id: disciplinary-actions
+    question: What disciplinary actions can follow a policy violation?
+    expected_path: docs
+    facts:
+      - Written warning
+      - Suspension
+      - Termination of employment in severe cases
+    tags: [list, split-chunks]
+
+  - id: growth-products
+    question: Which products does the Growth plan include, and which of them automates customer support?
+    expected_path: docs
+    facts:
+      - The Growth plan includes NexaChat, NexaInsight and NexaSupport
+      - NexaSupport is the customer support automation product
+    tags: [multi-hop]
+
+  # ---------- about the knowledge base's organization, but not in it ----------
+  - id: refund-policy
+    question: What is the refund policy of NexaAI?
+    expected_path: no_answer
+    facts: []
+    tags: [kb-gap, namesake-trap]
+
+  - id: paternity-leave
+    question: How many days of paternity leave does NexaAI give?
+    expected_path: no_answer
+    facts: []
+    tags: [kb-gap, namesake-trap]
+
+  - id: cfo
+    question: Who is the CFO of NexaAI?
+    expected_path: no_answer
+    facts: []
+    tags: [kb-gap, namesake-trap]
+
+  - id: platinum-plan
+    question: What does NexaAI's Platinum plan cost?
+    expected_path: no_answer
+    facts: []
+    tags: [kb-gap, false-premise]
+
+  # ---------- external, current: web fallback ----------
+  - id: t20-world-cup-2026
+    question: Who won the 2026 ICC Men's T20 World Cup?
+    expected_path: web
+    facts:
+      - India won the 2026 ICC Men's T20 World Cup
+    tags: [web]

@@ -550,10 +550,22 @@ def save_graph_diagram(app, path: str = GRAPH_PNG) -> None:
 # ======================================================================
 # RUN
 # ======================================================================
+def answer_path(res: State) -> Literal["direct", "docs", "web", "no_answer"]:
+    """Where the final answer came from."""
+    if not res.get("need_retrieval"):
+        return "direct"
+    if is_not_found(res.get("answer", "")):
+        return "no_answer"
+    if any(d.metadata.get("url") for d in res.get("relevant_docs", [])):
+        return "web"
+    return "docs"
+
+
 def print_result(res: State) -> None:
     print("=" * 100)
     print("QUESTION:", res["question"])
     print("NEED RETRIEVAL:", res.get("need_retrieval"))
+    print("PATH:", answer_path(res))
     if res.get("rewrites"):
         print(f"REWRITES: {res['rewrites']}/{MAX_REWRITES} (last query: {res['retrieval_query']})")
     if res.get("web_searched"):

@@ -9,3 +9,6 @@ company_docs/
 # per-corpus data (configs in corpora/ are tracked)
 corpora/*/docs/
 corpora/*/index/
+
+# eval summaries (experiments live in LangSmith)
+eval_results/
