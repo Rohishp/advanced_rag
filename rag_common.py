@@ -12,9 +12,27 @@ import yaml
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 INDEX_BATCH = 500  # max IDs per Chroma add/delete call
+REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+
+
+def chat_model(model: str, reasoning_effort: Optional[str] = None) -> ChatOpenAI:
+    """ChatOpenAI with only the sampling settings the model accepts.
+
+    No effort set: temperature 0 (models without reasoning settings).
+    'none': no reasoning, temperature 0.
+    Any other effort: no temperature; reasoning models reject it unless effort is 'none'.
+    """
+    if reasoning_effort and reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError(f"Unknown reasoning effort {reasoning_effort!r}; "
+                         f"expected one of {sorted(REASONING_EFFORTS)}")
+    if reasoning_effort and reasoning_effort != "none":
+        return ChatOpenAI(model=model, reasoning_effort=reasoning_effort)
+    extra = {"reasoning_effort": "none"} if reasoning_effort == "none" else {}
+    return ChatOpenAI(model=model, temperature=0, **extra)
 
 
 TextFix = Tuple[str, str]  # (regex pattern, replacement)

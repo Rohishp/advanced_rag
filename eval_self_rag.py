@@ -40,20 +40,20 @@ from pydantic import BaseModel, Field
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tracers.context import register_configure_hook
-from langchain_openai import ChatOpenAI
 from langsmith import Client, evaluate
 
 # ---------- Local ----------
 import self_rag
-from rag_common import CorpusConfig, PdfIndex
+from rag_common import CorpusConfig, PdfIndex, chat_model
 
 load_dotenv()
 
 EVAL_MODEL = os.getenv("EVAL_MODEL", "gpt-5.4")   # judge; stronger than the pipeline's model
+EVAL_REASONING_EFFORT = os.getenv("EVAL_REASONING_EFFORT") or None
 RESULTS_DIR = Path("eval_results")
 METRICS = ["correctness", "faithfulness", "citations", "path_match", "llm_calls", "latency_s"]
 
-judge = ChatOpenAI(model=EVAL_MODEL, temperature=0)
+judge = chat_model(EVAL_MODEL, EVAL_REASONING_EFFORT)
 
 
 # ======================================================================
@@ -151,7 +151,12 @@ def make_target(index: PdfIndex):
             "context": res.get("context", "") if grounded else "",
             "sources": [self_rag.source_label(d) for d in res.get("relevant_docs", [])]
                        if grounded else [],
+            "kept": [self_rag.source_label(d) for d in res.get("relevant_docs", [])],
+            "dropped": [self_rag.source_label(d) for d in res.get("docs", [])
+                        if d not in res.get("relevant_docs", [])],
             "support": res.get("support"),
+            "usefulness": res.get("usefulness"),
+            "usefulness_reason": res.get("usefulness_reason", ""),
             "rewrites": res.get("rewrites", 0),
             "revisions": res.get("revisions", 0),
             "web_searched": bool(res.get("web_searched")),
@@ -298,24 +303,35 @@ def summarize(results, experiment: str, corpus: str, reps: int) -> dict:
     per_case: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
     paths: Dict[str, list] = defaultdict(list)
     scopes: Dict[str, list] = defaultdict(list)
+    runs: Dict[str, list] = defaultdict(list)
     questions: Dict[str, str] = {}
     for row in results:
         case_id = row["example"].metadata["case_id"]
         questions[case_id] = row["example"].inputs["question"]
         paths[case_id].append(row["run"].outputs["path"])
-        scopes[case_id].append(row["run"].outputs.get("scope"))
+        out = row["run"].outputs
+        scopes[case_id].append(out.get("scope"))
+        detail = {k: out.get(k) for k in ("path", "scope", "rewrites", "web_searched", "kept",
+                                          "dropped", "usefulness", "usefulness_reason",
+                                          "llm_calls")}
+        detail["answer"] = out.get("answer", "")[:600]
+        detail["comments"] = {}
         for r in row["evaluation_results"]["results"]:
             per_case[case_id][r.key].append(r.score)
+            if r.comment and r.key in ("correctness", "faithfulness", "citations"):
+                detail["comments"][r.key] = r.comment
+        runs[case_id].append(detail)
 
     cases = {
         cid: {"question": questions[cid], "paths": paths[cid], "scopes": scopes[cid],
-              **{m: mean(per_case[cid][m]) for m in METRICS}}
+              **{m: mean(per_case[cid][m]) for m in METRICS}, "runs": runs[cid]}
         for cid in sorted(per_case)
     }
     overall = {m: mean([c[m] for c in cases.values()]) for m in METRICS}
     return {"experiment": experiment, "corpus": corpus, "created": datetime.now().isoformat(
         timespec="seconds"), "reps": reps, "llm_model": self_rag.LLM_MODEL,
-        "eval_model": EVAL_MODEL, "overall": overall, "cases": cases}
+        "llm_reasoning_effort": self_rag.LLM_REASONING_EFFORT, "eval_model": EVAL_MODEL,
+        "eval_reasoning_effort": EVAL_REASONING_EFFORT, "overall": overall, "cases": cases}
 
 
 def fmt(value) -> str:
@@ -383,7 +399,10 @@ def main(argv=None) -> None:
         num_repetitions=args.reps,
         max_concurrency=args.concurrency,
         metadata={"corpus": cfg.name, "llm_model": self_rag.LLM_MODEL,
-                  "eval_model": EVAL_MODEL, "reps": args.reps},
+                  "llm_reasoning_effort": self_rag.LLM_REASONING_EFFORT or "default",
+                  "eval_model": EVAL_MODEL,
+                  "eval_reasoning_effort": EVAL_REASONING_EFFORT or "default",
+                  "reps": args.reps},
         client=client,
     )
 

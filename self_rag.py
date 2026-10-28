@@ -32,12 +32,12 @@ from pydantic import BaseModel, Field
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, StateGraph
 
 # ---------- Local ----------
-from rag_common import CorpusConfig, PdfIndex, init_corpus, load_pdf
+from rag_common import CorpusConfig, PdfIndex, chat_model, init_corpus, load_pdf
 
 load_dotenv()
 
@@ -45,8 +45,11 @@ load_dotenv()
 # ======================================================================
 # CONFIG
 # ======================================================================
-EMBED_MODEL = "text-embedding-3-large"
-LLM_MODEL = "gpt-5.4-mini"
+# Models are set in .env; the values here are only defaults.
+# EMBED_MODEL: an existing index was built with one model, so changing it needs a new db_dir.
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-large")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4-mini")
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT") or None   # e.g. none, low, medium
 
 WEB_MAX_RESULTS = 5     # Tavily results for the web fallback
 
@@ -64,7 +67,7 @@ KB_DESCRIPTION_FILE = "kb_description.json"   # cache in the corpus's db_dir
 # CLIENTS
 # ======================================================================
 embeddings = OpenAIEmbeddings(model=EMBED_MODEL)
-llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+llm = chat_model(LLM_MODEL, LLM_REASONING_EFFORT)
 tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general", search_depth="advanced")
 
 
@@ -87,6 +90,7 @@ def run_config(index: PdfIndex, kb_description: str) -> RunnableConfig:
             "corpus": cfg.name,
             "collection": cfg.collection,
             "llm_model": LLM_MODEL,
+            "llm_reasoning_effort": LLM_REASONING_EFFORT or "default",
             "embed_model": EMBED_MODEL,
             "retriever_k": cfg.retriever_k,
             "chunk_size": cfg.chunk_size,
@@ -216,13 +220,16 @@ def retrieve(state: State, config: RunnableConfig) -> State:
 class RelevanceGrade(BaseModel):
     # the entity is named first so the two checks below refer to it
     question_entity: str = Field(
-        description="The specific organization, person or product the question is about, "
-                    "or 'none'."
+        description="The organization or person the question is about (for a product, plan, "
+                    "policy or role: the organization it belongs to), or 'none'."
     )
     same_entity: bool = Field(
-        description="The text is about that same entity (true if question_entity is 'none')."
+        description="The text is about that organization or person, including its own "
+                    "products, plans, people and policies (true if question_entity is 'none')."
     )
-    on_topic: bool = Field(description="The text discusses the subject the question asks about.")
+    on_topic: bool = Field(
+        description="The text has information for at least one part of the question."
+    )
 
 
 relevance_chain = ChatPromptTemplate.from_messages(
@@ -233,13 +240,15 @@ relevance_chain = ChatPromptTemplate.from_messages(
             "The knowledge base contains {kb_description}. A text whose source is a file comes "
             "from it and is about the knowledge base's own organization unless it says "
             "otherwise. A text whose source starts with 'web:' comes from a web search.\n"
-            "1. question_entity: the specific organization, person or product asked about, "
-            "or 'none'.\n"
-            "2. same_entity: the text is about exactly that entity. A different entity with "
-            "a similar or overlapping name (e.g. 'Acme Labs' vs 'Acme Systems') is not the "
-            "same. A web text counts only if it names the entity.\n"
-            "3. on_topic: the text discusses the subject asked about; it need not contain "
-            "the whole answer.",
+            "1. question_entity: the organization or person the question is about. If it "
+            "asks about a product, plan, policy or role, name the organization it belongs "
+            "to. 'none' if it is about no specific one.\n"
+            "2. same_entity: the text is about that organization or person, including any of "
+            "its own products, plans, people and policies. A different entity with a similar "
+            "or overlapping name (e.g. 'Acme Labs' vs 'Acme Systems') is not the same. A web "
+            "text counts only if it names the entity.\n"
+            "3. on_topic: the text has information for at least one part of the question; "
+            "it need not answer all of it.",
         ),
         ("human", "Question: {question}\n\nSource: {source}\nText:\n{chunk}"),
     ]
