@@ -4,6 +4,7 @@ The graph flow is documented in build_graph().
 """
 
 # ---------- Standard library ----------
+from datetime import date
 import hashlib
 import json
 from pathlib import Path
@@ -15,6 +16,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 # ---------- LangChain / LangGraph ----------
+from langchain_tavily import TavilySearch
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
@@ -40,6 +42,7 @@ RETRIEVER_K = 4         # chunks returned per query
 MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
 MAX_REVISIONS = 2       # support-driven rewrites per answer
 MAX_REWRITES = 2        # retrieval retries with a rewritten query
+WEB_MAX_RESULTS = 5     # Tavily results for the web fallback
 INDEX_BATCH = 500       # max IDs per Chroma add/delete call
 
 RECURSION_LIMIT = 50    # max graph steps per question
@@ -166,6 +169,7 @@ def index_folder(folder: Path) -> None:
 
 retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
 llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general")
 
 
 # GRAPH STATE
@@ -177,7 +181,12 @@ class State(TypedDict, total=False):
     # rewrite_question
     retrieval_query: str
     rewrites: int
-    # retrieve
+    # rewrite_web_query
+    web_query: str
+    web_time_range: Optional[Literal["day", "week", "month", "year"]]
+    # web_search
+    web_searched: bool
+    # retrieve, web_search
     docs: List[Document]
     # grade_documents
     relevant_docs: List[Document]
@@ -511,6 +520,11 @@ rewrite_prompt = ChatPromptTemplate.from_messages(
 )
 rewrite_chain = rewrite_prompt | llm.with_structured_output(RetrievalQuery)
 
+def fresh_pass() -> State:
+    """Reset per-pass fields before retrieving or searching again."""
+    return {"revisions": 0,
+            "support": None, "evidence": [], "support_reason": "",
+            "usefulness": None, "usefulness_reason": ""}
 
 def rewrite_question(state: State) -> State:
     if state.get("usefulness") == "not_useful":
@@ -525,9 +539,69 @@ def rewrite_question(state: State) -> State:
     )
     # new retrieval pass: reset the revision budget and clear the old verdicts
     return {"retrieval_query": out.query, "rewrites": state.get("rewrites", 0) + 1,
-            "revisions": 0,
-            "support": None, "evidence": [], "support_reason": "",
-            "usefulness": None, "usefulness_reason": ""}
+            **fresh_pass()}
+
+
+# ---------- Node: REWRITE the question into a web search query ----------
+class WebQuery(BaseModel):
+    query: str = Field(description="Keyword web search query, 6-14 words.")
+    time_range: Optional[Literal["day", "week", "month", "year"]] = Field(
+        default=None,
+        description="Recency filter only if the question names a recent period; otherwise null.",
+    )
+
+
+web_query_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "Rewrite the user question into a web search query composed of keywords.\n"
+            "Rules:\n"
+            "- Keep it short (6-14 words).\n"
+            "- Today's date is {today}. Replace relative dates (e.g. 'last week', "
+            "'this year') with explicit dates, months or years.\n"
+            "- Set time_range only if the question asks about a specific recent period "
+            "(e.g. 'today', 'this week', 'last month'). Words like 'latest' or "
+            "'current' alone do not justify a filter, because the latest event may be "
+            "months old. Otherwise leave it null.\n"
+            "- Do NOT answer the question.",
+        ),
+        ("human", "Question: {question}"),
+    ]
+)
+web_query_chain = web_query_prompt | llm.with_structured_output(WebQuery)
+
+
+def rewrite_web_query(state: State) -> State:
+    out = web_query_chain.invoke(
+        {"question": state["question"], "today": date.today().isoformat()}
+    )
+    return {"web_query": out.query, "web_time_range": out.time_range, **fresh_pass()}
+
+
+# ---------- Node: WEB SEARCH (runs at most once per question) ----------
+def web_search(state: State) -> State:
+    """Search the web; keep only page text in page_content (title/URL in metadata)."""
+    args = {"query": state["web_query"]}
+    if state.get("web_time_range"):
+        args["time_range"] = state["web_time_range"]
+
+    try:
+        response = tavily.invoke(args)
+    except Exception as e:  # missing API key, network error, ...
+        print(f"Web search failed: {e}")
+        response = {}
+
+    results = response.get("results", []) if isinstance(response, dict) else []
+    docs = [
+        Document(
+            page_content=r["content"],
+            metadata={"source": r.get("title") or "web", "url": r.get("url", "")},
+        )
+        for r in results
+        if r.get("content")
+    ]
+    return {"docs": docs, "web_searched": True}
 
 
 # ---------- Routing ----------
@@ -535,14 +609,19 @@ def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
     return "retrieve" if state["need_retrieval"] else "generate_direct"
 
 
-def can_rewrite(state: State) -> bool:
-    return state.get("rewrites", 0) < MAX_REWRITES
+def next_attempt(state: State) -> Literal["rewrite_question", "rewrite_web_query", "no_answer"]:
+    """Internal rewrites first, then one web search, then give up."""
+    if state.get("rewrites", 0) < MAX_REWRITES:
+        return "rewrite_question"
+    if not state.get("web_searched"):
+        return "rewrite_web_query"
+    return "no_answer"
 
 
-def route_after_grade(state: State) -> Literal["generate", "rewrite_question", "no_answer"]:
-    if state.get("relevant_docs"):
-        return "generate"
-    return "rewrite_question" if can_rewrite(state) else "no_answer"
+def route_after_grade(
+    state: State,
+) -> Literal["generate", "rewrite_question", "rewrite_web_query", "no_answer"]:
+    return "generate" if state.get("relevant_docs") else next_attempt(state)
 
 
 def route_after_support(state: State) -> Literal["revise_answer", "accept"]:
@@ -553,10 +632,10 @@ def route_after_support(state: State) -> Literal["revise_answer", "accept"]:
     return "revise_answer"
 
 
-def route_after_usefulness(state: State) -> Literal["done", "rewrite_question", "no_answer"]:
-    if state["usefulness"] == "useful":
-        return "done"
-    return "rewrite_question" if can_rewrite(state) else "no_answer"
+def route_after_usefulness(
+    state: State,
+) -> Literal["done", "rewrite_question", "rewrite_web_query", "no_answer"]:
+    return "done" if state["usefulness"] == "useful" else next_attempt(state)
 
 
 # BUILD GRAPH
@@ -565,11 +644,14 @@ def build_graph():
          -> generate_direct -> END
          -> retrieve -> grade_documents
               -> generate -> check_support <-> revise_answer -> check_usefulness
-                   -> END                                   (useful)
-                   -> rewrite_question -> retrieve           (not useful, retries left)
-                   -> no_answer -> END                       (not useful, no retries left)
-              -> rewrite_question -> retrieve                (no relevant chunks, retries left)
-              -> no_answer -> END                            (no relevant chunks, no retries left)
+                   -> END                                         (useful)
+                   -> next attempt                                (not useful)
+              -> next attempt                                     (no relevant chunks)
+
+    next attempt, in order:
+         rewrite_question -> retrieve                 (up to MAX_REWRITES times)
+         rewrite_web_query -> web_search -> grade_documents   (once)
+         no_answer -> END
     """
     g = StateGraph(State)
     g.add_node("decide_retrieval", decide_retrieval)
@@ -581,7 +663,15 @@ def build_graph():
     g.add_node("revise_answer", revise_answer)
     g.add_node("check_usefulness", check_usefulness)
     g.add_node("rewrite_question", rewrite_question)
+    g.add_node("rewrite_web_query", rewrite_web_query)
+    g.add_node("web_search", web_search)
     g.add_node("no_answer", no_answer)
+
+    next_attempt_targets = {
+        "rewrite_question": "rewrite_question",
+        "rewrite_web_query": "rewrite_web_query",
+        "no_answer": "no_answer",
+    }
 
     g.add_edge(START, "decide_retrieval")
     g.add_conditional_edges(
@@ -595,8 +685,7 @@ def build_graph():
     g.add_conditional_edges(
         "grade_documents",
         route_after_grade,
-        {"generate": "generate", "rewrite_question": "rewrite_question",
-         "no_answer": "no_answer"},
+        {"generate": "generate", **next_attempt_targets},
     )
 
     g.add_edge("generate", "check_support")
@@ -610,10 +699,12 @@ def build_graph():
     g.add_conditional_edges(
         "check_usefulness",
         route_after_usefulness,
-        {"done": END, "rewrite_question": "rewrite_question", "no_answer": "no_answer"},
+        {"done": END, **next_attempt_targets},
     )
 
     g.add_edge("rewrite_question", "retrieve")
+    g.add_edge("rewrite_web_query", "web_search")
+    g.add_edge("web_search", "grade_documents")
     g.add_edge("no_answer", END)
     return g.compile()
 
