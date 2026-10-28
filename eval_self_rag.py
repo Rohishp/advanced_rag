@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -38,6 +39,7 @@ from pydantic import BaseModel, Field
 # ---------- LangChain / LangSmith ----------
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tracers.context import register_configure_hook
 from langchain_openai import ChatOpenAI
 from langsmith import Client, evaluate
 
@@ -121,20 +123,31 @@ class LlmCallCounter(BaseCallbackHandler):
         self._count()
 
 
+# Registered like LangChain's own usage tracker: every callback manager created while the
+# variable is set picks the counter up, so it never has to be passed in the invoke config
+# (an explicit callbacks list there can interfere with the LangSmith tracer).
+_call_counter: ContextVar[Optional[LlmCallCounter]] = ContextVar("llm_call_counter", default=None)
+register_configure_hook(_call_counter, inheritable=True)
+
+
 def make_target(index: PdfIndex):
     app = self_rag.build_graph()
     base_config = self_rag.run_config(index, self_rag.kb_description_for(index))
 
     def target(inputs: dict) -> dict:
         counter = LlmCallCounter()
+        token = _call_counter.set(counter)
         start = time.perf_counter()
-        res = app.invoke({"question": inputs["question"]},
-                         config={**base_config, "callbacks": [counter]})
+        try:
+            res = app.invoke({"question": inputs["question"]}, config=base_config)
+        finally:
+            _call_counter.reset(token)
         path = self_rag.answer_path(res)
         grounded = path in ("docs", "web")
         return {
             "answer": res.get("answer", ""),
             "path": path,
+            "scope": res.get("scope"),
             "context": res.get("context", "") if grounded else "",
             "sources": [self_rag.source_label(d) for d in res.get("relevant_docs", [])]
                        if grounded else [],
@@ -284,16 +297,18 @@ def mean(values: List[Optional[float]]) -> Optional[float]:
 def summarize(results, experiment: str, corpus: str, reps: int) -> dict:
     per_case: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
     paths: Dict[str, list] = defaultdict(list)
+    scopes: Dict[str, list] = defaultdict(list)
     questions: Dict[str, str] = {}
     for row in results:
         case_id = row["example"].metadata["case_id"]
         questions[case_id] = row["example"].inputs["question"]
         paths[case_id].append(row["run"].outputs["path"])
+        scopes[case_id].append(row["run"].outputs.get("scope"))
         for r in row["evaluation_results"]["results"]:
             per_case[case_id][r.key].append(r.score)
 
     cases = {
-        cid: {"question": questions[cid], "paths": paths[cid],
+        cid: {"question": questions[cid], "paths": paths[cid], "scopes": scopes[cid],
               **{m: mean(per_case[cid][m]) for m in METRICS}}
         for cid in sorted(per_case)
     }
