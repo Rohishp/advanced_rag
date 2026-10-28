@@ -242,6 +242,11 @@ def generate_direct(state: State) -> State:
     return {"answer": out.content}
 
 
+# ---------- Node: NO ANSWER ----------
+def no_answer(state: State) -> State:
+    return {"answer": NO_ANSWER, "context": ""}
+
+
 # ---------- Node: RETRIEVE ----------
 def retrieve(state: State) -> State:
     return {"docs": retriever.invoke(state["question"])}
@@ -331,17 +336,20 @@ def generate(state: State) -> State:
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
     return "retrieve" if state["need_retrieval"] else "generate_direct"
 
+def route_after_grade(state: State) -> Literal["generate", "no_answer"]:
+    return "generate" if state.get("relevant_docs") else "no_answer"
 
 # BUILD GRAPH
 def build_graph():
     """START -> decide_retrieval -> (generate_direct
-                                     | retrieve -> grade_documents -> generate) -> END"""
+                                     | retrieve -> grade_documents -> (generate | no_answer)) -> END"""
     g = StateGraph(State)
     g.add_node("decide_retrieval", decide_retrieval)
     g.add_node("generate_direct", generate_direct)
     g.add_node("retrieve", retrieve)
     g.add_node("grade_documents", grade_documents)
     g.add_node("generate", generate)
+    g.add_node("no_answer", no_answer)
 
     g.add_edge(START, "decide_retrieval")
     g.add_conditional_edges(
@@ -351,8 +359,13 @@ def build_graph():
     )
     g.add_edge("generate_direct", END)
     g.add_edge("retrieve", "grade_documents")
-    g.add_edge("grade_documents", "generate")
+    g.add_conditional_edges(
+        "grade_documents",
+        route_after_grade,
+        {"generate": "generate", "no_answer": "no_answer"},
+    )
     g.add_edge("generate", END)
+    g.add_edge("no_answer", END)
     return g.compile()
 
 
