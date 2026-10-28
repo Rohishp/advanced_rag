@@ -1,36 +1,79 @@
-import re
-from typing import List, Literal, Optional, TypedDict
-from pydantic import BaseModel, Field
-from datetime import date
-from langchain_tavily import TavilySearch
-import json
+"""Corrective RAG over local PDF books, with web search fallback.
+
+Flow: retrieve -> evaluate chunks -> (refine | rewrite query -> web search -> refine)
+      -> generate
+"""
+
+# ---------- Standard library ----------
 import hashlib
-from langchain_chroma import Chroma
+import json
+import re
+from datetime import date
 from pathlib import Path
+from typing import List, Literal, Optional, TypedDict
+
+# ---------- Third-party ----------
 import pymupdf4llm
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+# ---------- LangChain / LangGraph ----------
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-
-from langgraph.graph import StateGraph, START, END
-from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_tavily import TavilySearch
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.graph import END, START, StateGraph
 
 load_dotenv()
 
-DOCS_DIR = Path("./documents")
 
+# ======================================================================
+# CONFIG
+# ======================================================================
+DOCS_DIR = Path("./documents")             # PDFs to index
+DB_DIR = "./chroma_db"                     # Chroma storage
+MANIFEST = Path(DB_DIR) / "manifest.json"  # fingerprints of indexed PDFs
+
+EMBED_MODEL = "text-embedding-3-large"
+LLM_MODEL = "gpt-5.4-mini"
+
+CHUNK_SIZE = 512        # tokens per chunk
+CHUNK_OVERLAP = 64      # tokens shared between neighbouring chunks
+RETRIEVER_K = 4         # chunks returned per question
+RETRIEVER_FETCH_K = 20  # candidates considered by MMR
+
+UPPER_TH = 0.7          # evaluator score above this: clearly relevant
+LOWER_TH = 0.3          # evaluator score below this: irrelevant
+
+WEB_MAX_RESULTS = 5
+MAX_CONCURRENCY = 10    # parallel LLM calls in .batch()
+
+QUESTIONS = [
+    "Explain the bias–variance tradeoff",                                           # in the books
+    "What are attention mechanisms and why are they important in current models?",  # in the books
+    "AI news from last week",                                                       # needs the web
+]
+
+
+# ======================================================================
+# 1) LOAD PDFs
+# ======================================================================
 def clean(text: str) -> str:
-    # strip lone surrogates from PDF extraction
+    """Strip lone surrogates that PDF extraction sometimes produces."""
     return text.encode("utf-8", "ignore").decode("utf-8", "ignore")
 
+
 def load_pdf(path: Path) -> list[Document]:
+    """Read one PDF as Markdown, one Document per non-empty page."""
     pages = pymupdf4llm.to_markdown(str(path), page_chunks=True)
     return [
         Document(
             page_content=clean(p["text"]),
             metadata={
                 "source": path.name,
+                # key differs between pymupdf4llm versions; fall back to position
                 "page": p["metadata"].get("page") or p["metadata"].get("page_number") or n,
             },
         )
@@ -38,30 +81,29 @@ def load_pdf(path: Path) -> list[Document]:
         if p["text"].strip()
     ]
 
-DB_DIR = "./chroma_db"
 
+# ======================================================================
+# 2) INDEX (persistent; only new or changed PDFs are processed)
+# ======================================================================
 splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-    chunk_size=512, chunk_overlap=64
+    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
 )
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
 vector_store = Chroma(
     collection_name="books",
-    embedding_function=embeddings,
+    embedding_function=OpenAIEmbeddings(model=EMBED_MODEL),
     persist_directory=DB_DIR,
 )
 
+
 def chunk_id(doc: Document) -> str:
-    """Make a unique, repeatable ID from source + page + text.
-    Same chunk -> same ID every run, which lets us skip re-embedding it."""
+    """Stable ID from source + page + text, so re-runs skip existing chunks."""
     key = f"{doc.metadata['source']}|{doc.metadata['page']}|{doc.page_content}"
     return hashlib.sha256(key.encode()).hexdigest()
 
-MANIFEST = Path(DB_DIR) / "manifest.json"   # lives inside chroma_db, so deleting the folder resets it too
-
 
 def file_hash(path: Path) -> str:
-    """Fingerprint of the PDF file itself: changes only if the file changes."""
+    """Fingerprint of the PDF file itself."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -71,13 +113,11 @@ def index_folder(folder: Path, batch_size: int = 500) -> None:
 
     for pdf in sorted(folder.glob("*.pdf")):
         fingerprint = file_hash(pdf)
-
-        # Unchanged since last indexing -> skip the slow load/split entirely
         if manifest.get(pdf.name) == fingerprint:
             print(f"{pdf.name}: unchanged, skipped")
             continue
 
-        # File was indexed before but has changed -> remove its old chunks first
+        # Changed file: remove its old chunks first
         if pdf.name in manifest:
             old_ids = vector_store.get(where={"source": pdf.name})["ids"]
             for start in range(0, len(old_ids), batch_size):
@@ -85,7 +125,7 @@ def index_folder(folder: Path, batch_size: int = 500) -> None:
 
         chunks = splitter.split_documents(load_pdf(pdf))
 
-        # Remove identical chunks (repeated headers etc.)
+        # De-duplicate identical chunks (repeated headers etc.)
         unique: dict[str, Document] = {}
         for c in chunks:
             unique.setdefault(chunk_id(c), c)
@@ -100,57 +140,59 @@ def index_folder(folder: Path, batch_size: int = 500) -> None:
         print(f"{pdf.name}: {len(chunks)} chunks, {len(ids)} unique, "
               f"{len(new_ids)} newly embedded")
 
-        # Record this file as indexed (saved after each book, so a crash
-        # halfway doesn't lose progress)
+        # Save after each book so a crash halfway keeps progress
         manifest[pdf.name] = fingerprint
         MANIFEST.parent.mkdir(parents=True, exist_ok=True)
         MANIFEST.write_text(json.dumps(manifest, indent=2))
 
 
-index_folder(DOCS_DIR)
-# The retriever finds chunks for a question.
-# MMR = fetch the 20 most similar chunks, then pick 4 that are relevant
-# AND different from each other (avoids 4 near-duplicate passages).
+# MMR: fetch FETCH_K similar chunks, keep K that are relevant AND diverse
 retriever = vector_store.as_retriever(
     search_type="mmr",
-    search_kwargs={"k": 4, "fetch_k": 20},
+    search_kwargs={"k": RETRIEVER_K, "fetch_k": RETRIEVER_FETCH_K},
 )
 
+llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general")
 
-# 4) LLM + prompt
-llm = ChatOpenAI(model="gpt-5.4-mini", temperature=0)
-# Relevance thresholds for the retrieval evaluator
-UPPER_TH = 0.7   # above this: chunk is clearly relevant
-LOWER_TH = 0.3   # below this: chunk is irrelevant
 
-# 5) GRAPH
+# ======================================================================
+# 3) GRAPH STATE
+# ======================================================================
 class State(TypedDict, total=False):
-    """Shared data that flows through the graph. Each node reads what
-    it needs and returns only the fields it changes.
-    total=False -> fields are optional, so we can start with just 'question'."""
+    """Data flowing through the graph; each node returns only what it changes."""
     question: str
-    docs: List[Document]       # chunks returned by the retriever
-    strips: List[str]          # all sentences cut from those chunks
-    kept_strips: List[str]     # sentences the filter judged relevant
-    refined_context: str       # kept sentences joined into one text
-    answer: str                # final answer
-    doc_scores: List[float]     # relevance score per retrieved chunk
-    good_docs: List[Document]   # chunks scoring above LOWER_TH
+    # retrieve
+    docs: List[Document]
+    # eval_each_doc
+    doc_scores: List[float]
+    doc_reasons: List[str]
+    good_docs: List[Document]
     verdict: Literal["CORRECT", "INCORRECT", "AMBIGUOUS"]
-    reason: str                 # why that verdict was chosen
-    doc_reasons: List[str]      # evaluator's justification per chunk
-    web_docs: List[Document]    # results from web search
-    web_query: str              # rewritten question used for web search
-    web_time_range: Optional[str]   # Tavily recency filter: day / week / month / year
+    reason: str
+    # rewrite_query + web_search
+    web_query: str
+    web_time_range: Optional[str]
+    web_docs: List[Document]
+    # refine
+    strips: List[str]
+    kept_strips: List[str]
+    refined_context: str
+    # generate
+    answer: str
 
 
+# ======================================================================
+# 4) NODES (in execution order)
+# ======================================================================
+
+# ---------- Node: RETRIEVE ----------
 def retrieve(state: State) -> State:
-    q = state["question"]
-    return {"docs": retriever.invoke(q)}
+    return {"docs": retriever.invoke(state["question"])}
+
 
 # ---------- Node: EVALUATE retrieved chunks ----------
 class DocEvalScore(BaseModel):
-    """Structured output: relevance score plus a short justification."""
     score: float
     reason: str
 
@@ -171,57 +213,31 @@ doc_eval_prompt = ChatPromptTemplate.from_messages(
         ("human", "Question: {question}\n\nChunk:\n{chunk}"),
     ]
 )
-
 doc_eval_chain = doc_eval_prompt | llm.with_structured_output(DocEvalScore)
 
 
 def eval_each_doc(state: State) -> State:
-    """Score every retrieved chunk and decide CORRECT / INCORRECT / AMBIGUOUS."""
-    q = state["question"]
+    """Score every chunk, then decide CORRECT / INCORRECT / AMBIGUOUS."""
     docs = state["docs"]
-
-    # Score all chunks in parallel instead of one by one
     results = doc_eval_chain.batch(
-        [{"question": q, "chunk": d.page_content} for d in docs],
-        config={"max_concurrency": 10},
+        [{"question": state["question"], "chunk": d.page_content} for d in docs],
+        config={"max_concurrency": MAX_CONCURRENCY},
     )
     scores = [r.score for r in results]
-    reasons = [r.reason for r in results]
-
-    # Chunks worth refining: anything above the lower threshold
     good = [d for d, s in zip(docs, scores) if s > LOWER_TH]
+    base = {"doc_scores": scores, "doc_reasons": [r.reason for r in results]}
 
-    # CORRECT: at least one chunk is clearly relevant
     if any(s > UPPER_TH for s in scores):
-        return {
-            "doc_scores": scores,
-            "good_docs": good,
-            "verdict": "CORRECT",
-            "doc_reasons": reasons,
-            "reason": f"At least one retrieved chunk scored > {UPPER_TH}.",
-        }
+        return {**base, "verdict": "CORRECT", "good_docs": good,
+                "reason": f"At least one retrieved chunk scored > {UPPER_TH}."}
 
-    # INCORRECT: nothing retrieved, or every chunk is irrelevant
     if not scores or all(s < LOWER_TH for s in scores):
-        return {
-            "doc_scores": scores,
-            "good_docs": [],
-            "verdict": "INCORRECT",
-            "doc_reasons": reasons,
-            "reason": f"All retrieved chunks scored < {LOWER_TH}. No chunk was sufficient.",
-        }
+        return {**base, "verdict": "INCORRECT", "good_docs": [],
+                "reason": f"All retrieved chunks scored < {LOWER_TH}."}
 
-    # AMBIGUOUS: some signal, but nothing convincing
-    return {
-        "doc_scores": scores,
-        "good_docs": good,
-        "verdict": "AMBIGUOUS",
-        "doc_reasons": reasons,
-        "reason": f"No chunk scored > {UPPER_TH}, but not all were < {LOWER_TH}. Mixed relevance signals.",
-    }
+    return {**base, "verdict": "AMBIGUOUS", "good_docs": good,
+            "reason": f"No chunk scored > {UPPER_TH}, but not all were < {LOWER_TH}."}
 
-# ---------- Node: WEB SEARCH (when the books aren't enough) ----------
-tavily = TavilySearch(max_results=5, topic="general")
 
 # ---------- Node: REWRITE question into a web search query ----------
 class WebQuery(BaseModel):
@@ -248,7 +264,6 @@ rewrite_prompt = ChatPromptTemplate.from_messages(
         ("human", "Question: {question}"),
     ]
 )
-
 rewrite_chain = rewrite_prompt | llm.with_structured_output(WebQuery)
 
 
@@ -258,42 +273,34 @@ def rewrite_query(state: State) -> State:
     )
     return {"web_query": out.query, "web_time_range": out.time_range}
 
+
+# ---------- Node: WEB SEARCH ----------
 def web_search(state: State) -> State:
-    """Search the web and turn the results into Documents."""
-    
+    """Search the web; keep only page text in page_content (title/URL in metadata)."""
     args = {"query": state.get("web_query") or state["question"]}
     if state.get("web_time_range"):
-        args["time_range"] = state["web_time_range"]   # real date filter in Tavily
+        args["time_range"] = state["web_time_range"]
 
     try:
         response = tavily.invoke(args)
-    except Exception as e:
+    except Exception as e:  # missing API key, network error, ...
         print(f"Web search failed: {e}")
         return {"web_docs": []}
 
     results = response.get("results", []) if isinstance(response, dict) else []
-    web_docs = [
-        Document(
-            page_content=r.get("content", ""),  # only the text gets refined
-            metadata={"source": r.get("title", "web"), "url": r.get("url", "")},
-        )
-        for r in results
-        if r.get("content")
-    ]
-    return {"web_docs": web_docs}
-
-# ---------- Helper: DECOMPOSE ----------
-def decompose_to_sentences(text: str) -> List[str]:
-    """Split a block of text into sentences ("strips")."""
-    # Collapse newlines/tabs/multiple spaces into single spaces
-    text = re.sub(r"\s+", " ", text).strip()
-    # Split after . ! or ? followed by whitespace.
-    # (?<=...) is a lookbehind: the punctuation stays with its sentence.
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    # Drop tiny fragments (page numbers, headings, formula bits)
-    return [s.strip() for s in sentences if len(s.strip()) > 20]
+    return {
+        "web_docs": [
+            Document(
+                page_content=r["content"],
+                metadata={"source": r.get("title", "web"), "url": r.get("url", "")},
+            )
+            for r in results
+            if r.get("content")
+        ]
+    }
 
 
+# ---------- Node: REFINE (decompose -> filter -> recompose) ----------
 class KeepOrDrop(BaseModel):
     keep: bool
 
@@ -309,49 +316,38 @@ filter_prompt = ChatPromptTemplate.from_messages(
         ("human", "Question: {question}\n\nSentence:\n{sentence}"),
     ]
 )
-
-# prompt | model: fill the template, send it to the LLM, and parse the
-# reply into a KeepOrDrop object (because of with_structured_output).
 filter_chain = filter_prompt | llm.with_structured_output(KeepOrDrop)
 
-# ---------- Node 2: REFINE (decompose -> filter -> recompose) ----------
+
+def decompose_to_sentences(text: str) -> List[str]:
+    """Split text into sentences; drop fragments of 20 characters or fewer."""
+    text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in sentences if len(s.strip()) > 20]
+
+
 def refine(state: State) -> State:
-    q = state["question"]
-
-    # Book chunks the evaluator kept + web results (either may be empty)
+    """Keep only the sentences (from books and/or web) that help answer."""
     docs = state.get("good_docs", []) + state.get("web_docs", [])
-    context = "\n\n".join(d.page_content for d in docs).strip()
-    # 1) DECOMPOSE: text -> list of sentences
-    strips = decompose_to_sentences(context)
+    strips = decompose_to_sentences("\n\n".join(d.page_content for d in docs))
 
-    # 2) FILTER: ask the LLM about every sentence.
-    # .batch() sends the requests in parallel (up to 10 at a time)
-    # instead of one after another, which is much faster.
     results = filter_chain.batch(
-        [{"question": q, "sentence": s} for s in strips],
-        config={"max_concurrency": 10},
+        [{"question": state["question"], "sentence": s} for s in strips],
+        config={"max_concurrency": MAX_CONCURRENCY},
     )
-    # Pair each sentence with its verdict and keep the "true" ones
     kept = [s for s, r in zip(strips, results) if r.keep]
 
-    # 3) RECOMPOSE: join the survivors into the context for the answer
-    refined_context = "\n".join(kept).strip()
-
-    return {
-        "strips": strips,
-        "kept_strips": kept,
-        "refined_context": refined_context,
-    }
+    return {"strips": strips, "kept_strips": kept, "refined_context": "\n".join(kept)}
 
 
-
-
+# ---------- Node: GENERATE ----------
 answer_prompt = ChatPromptTemplate.from_messages(
     [
         (
             "system",
             "You are a helpful ML tutor. Answer ONLY using the provided refined bullets.\n"
-            "If the bullets are empty or insufficient, say: 'I don't know based on the available sources.'",
+            "If the bullets are empty or insufficient, say: "
+            "'I don't know based on the available sources.'",
         ),
         ("human", "Question: {question}\n\nRefined context:\n{refined_context}"),
     ]
@@ -359,97 +355,81 @@ answer_prompt = ChatPromptTemplate.from_messages(
 
 
 def generate(state: State) -> State:
-    """Write the final answer using only the filtered sentences."""
     out = (answer_prompt | llm).invoke(
         {"question": state["question"], "refined_context": state["refined_context"]}
     )
-    return {"answer": out.content}  # .content = the text of the reply
+    return {"answer": out.content}
 
 
-
+# ---------- Routing ----------
 def route_after_eval(state: State) -> str:
-    """Pick the next node based on the evaluator's verdict."""
-    if state["verdict"] == "CORRECT":
-        return "refine"      # books are enough
-    return "web_search"      # INCORRECT: web only; AMBIGUOUS: web + partial book chunks
+    """CORRECT: books only. INCORRECT: web only. AMBIGUOUS: web + partial book chunks."""
+    return "refine" if state["verdict"] == "CORRECT" else "web_search"
 
-g = StateGraph(State)
-g.add_node("retrieve", retrieve)
-g.add_node("eval_each_doc", eval_each_doc)
-g.add_node("web_search", web_search)
-g.add_node("refine", refine)
-g.add_node("generate", generate)
-g.add_node("rewrite_query", rewrite_query)
 
-# START -> retrieve -> eval_each_doc -> (refine | web_search -> refine) -> generate -> END
-g.add_edge(START, "retrieve")
-g.add_edge("retrieve", "eval_each_doc")
-g.add_conditional_edges(
-    "eval_each_doc",
-    route_after_eval,
-    {"refine": "refine", "web_search": "rewrite_query"},
-)
-g.add_edge("rewrite_query", "web_search")
-g.add_edge("web_search", "refine")
-g.add_edge("refine", "generate")
-g.add_edge("generate", END)
+# ======================================================================
+# 5) BUILD GRAPH
+# ======================================================================
+def build_graph():
+    """START -> retrieve -> eval_each_doc -> (refine | rewrite_query -> web_search -> refine)
+    -> generate -> END"""
+    g = StateGraph(State)
+    g.add_node("retrieve", retrieve)
+    g.add_node("eval_each_doc", eval_each_doc)
+    g.add_node("rewrite_query", rewrite_query)
+    g.add_node("web_search", web_search)
+    g.add_node("refine", refine)
+    g.add_node("generate", generate)
 
-app = g.compile()  # turn the definition into a runnable app
+    g.add_edge(START, "retrieve")
+    g.add_edge("retrieve", "eval_each_doc")
+    g.add_conditional_edges(
+        "eval_each_doc",
+        route_after_eval,
+        {"refine": "refine", "web_search": "rewrite_query"},
+    )
+    g.add_edge("rewrite_query", "web_search")
+    g.add_edge("web_search", "refine")
+    g.add_edge("refine", "generate")
+    g.add_edge("generate", END)
+    return g.compile()
 
-# Save a diagram of the graph (needs internet: rendered via mermaid.ink)
-try:
-    Path("graph.png").write_bytes(app.get_graph().draw_mermaid_png())
-except Exception:
-    print(app.get_graph().draw_mermaid())   # offline fallback: Mermaid text
-    
-# 5) Run
-# 
-QUESTIONS = [
-    "Explain the bias–variance tradeoff",                                     # expect CORRECT
-    "What are attention mechanisms and why are they important in current models?",  # likely AMBIGUOUS
-    "AI news from last week",                                                 # expect INCORRECT
-]
 
-for q in QUESTIONS:
-    res = app.invoke({"question": q})
+def save_graph_diagram(app, path: str = "graph.png") -> None:
+    """Render the graph via mermaid.ink (needs internet); print Mermaid text offline."""
+    try:
+        Path(path).write_bytes(app.get_graph().draw_mermaid_png())
+    except Exception:
+        print(app.get_graph().draw_mermaid())
+
+
+# ======================================================================
+# 6) RUN
+# ======================================================================
+def print_result(res: State) -> None:
     print("=" * 100)
-    print("QUESTION:", q)
-    print(f"VERDICT: {res['verdict']} ({res['reason']})")
+    print("QUESTION:", res["question"])
+    print(f"VERDICT:  {res['verdict']} ({res['reason']})")
 
-    print("=" * 100)
-
+    print("\nBOOK CHUNKS:")
     for d, s, why in zip(res["docs"], res["doc_scores"], res["doc_reasons"]):
         print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {why}")
 
-    print("=" * 100)
-
-    for d in res.get("web_docs", []):
-        print(f"  web: {d.metadata['source']} ({d.metadata['url']})")
-
-    print("=" * 100)
-
     if res.get("web_query"):
-        print(f"WEB QUERY: {res['web_query']} (time_range={res.get('web_time_range')})")
-    print("\nANSWER:\n", res["answer"])
-    
-# print(res["answer"])
-# print()
+        print(f"\nWEB QUERY: {res['web_query']} (time_range={res.get('web_time_range')})")
+        for d in res.get("web_docs", []):
+            print(f"  web: {d.metadata['source']} ({d.metadata['url']})")
 
-# print(f"Verdict: {res['verdict']} ({res['reason']})")
-# for d, s in zip(res["docs"], res["doc_scores"]):
-#     print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
-# print("*" * 100)
+    print("\nANSWER:\n" + res["answer"])
 
-# print(f"Kept {len(res['kept_strips'])} of {len(res['strips'])} sentences:")
-# for s in res["kept_strips"]:
-#     print("-", s)
-# print("*" * 100)
 
-# for i, d in enumerate(res["docs"], 1):
-#     print(f"[{i}] {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}")
-#     print(d.page_content[:500])
-#     print("*" * 100)
+def main() -> None:
+    index_folder(DOCS_DIR)
+    app = build_graph()
+    save_graph_diagram(app)
+    for q in QUESTIONS:
+        print_result(app.invoke({"question": q}))
 
-# for d, s, why in zip(res["docs"], res["doc_scores"], res["doc_reasons"]):
-#     print(f"  {s:.2f}  {d.metadata.get('source', '?')} p.{d.metadata.get('page', '?')}: {why}")
 
+if __name__ == "__main__":
+    main()

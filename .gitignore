@@ -3,3 +3,5 @@ chroma_db/
 __pycache__/
 .venv/
 documents/
+chroma_company/
+company_docs/
