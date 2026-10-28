@@ -729,6 +729,10 @@ def print_result(res: State) -> None:
         print(f"REWRITES: {res['rewrites']}/{MAX_REWRITES} "
               f"(last query: {res['retrieval_query']})")
 
+    if res.get("web_searched"):
+        print(f"WEB QUERY: {res.get('web_query')} "
+              f"(time_range={res.get('web_time_range')})")
+
     if res.get("docs"):
         relevant = res.get("relevant_docs", [])
         print(f"\nSOURCES ({len(relevant)}/{len(res['docs'])} relevant):")
