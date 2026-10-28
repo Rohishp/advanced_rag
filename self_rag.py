@@ -169,8 +169,7 @@ def index_folder(folder: Path) -> None:
 
 retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
 llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
-tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general")
-
+tavily = TavilySearch(max_results=WEB_MAX_RESULTS, topic="general", search_depth="advanced")
 
 # GRAPH STATE
 class State(TypedDict, total=False):
@@ -335,6 +334,9 @@ rag_prompt = ChatPromptTemplate.from_messages(
             "[Company_Policies.pdf p.1] or [web: Title (https://...)].\n"
             "- If the context only partly answers the question, answer that part and "
             "say what is missing.\n"
+            "- If the question asks for the latest or most recent item, identify it from "
+            "explicit dates, stages (e.g. 'final') or statements such as 'current "
+            "champion' in the context, and say which of these the answer is based on.\n"
             "- If the context does not answer the question at all, reply exactly: "
             "\"{no_answer}\"\n"
             "- Do not mention 'the context' in your answer.\n"
@@ -385,6 +387,9 @@ support_prompt = ChatPromptTemplate.from_messages(
             "(e.g. 'the documents do not directly describe the culture') are honest "
             "limitations, not claims, and count as supported. Source labels like "
             "[file p.N] are not claims either.\n"
+            "A conclusion that follows directly from explicitly stated dates, stages or "
+            "titles counts as supported when the answer names that basis (e.g. 'the "
+            "sources list India as the current champion').\n"
             "- partially_supported: the core facts are in the context, but the answer "
             "adds anything that is not: interpretive or qualitative words (e.g. "
             "'generous', 'emphasizes', 'strong', 'employee-first'), inferred causes or "
@@ -574,7 +579,9 @@ web_query_prompt = ChatPromptTemplate.from_messages(
             "(e.g. 'today', 'this week', 'last month'). Words like 'latest' or "
             "'current' alone do not justify a filter, because the latest event may be "
             "months old. Otherwise leave it null.\n"
-            "- Do NOT answer the question.",
+            "- Do NOT answer the question."
+            "- For questions about the latest or most recent event, add the current "
+            "year so results focus on the newest edition or season.\n",
         ),
         ("human", "Question: {question}"),
     ]
