@@ -21,7 +21,6 @@ Metrics (higher is better, except llm_calls and latency_s):
 import argparse
 import json
 import os
-import re
 import statistics
 import sys
 import threading
@@ -314,15 +313,12 @@ def faithfulness(outputs: dict) -> dict:
             "comment": "unsupported: " + "; ".join(unsupported) if unsupported else "all supported"}
 
 
-CITATION = re.compile(r"\[([^\[\]\n]+)\](?!\()")   # [label], but not markdown [text](url)
-
-
 def citations(outputs: dict) -> dict:
     """Share of cited labels that exist in the context; uncited grounded answers score 0."""
     if outputs["path"] not in ("docs", "web"):
         return {"key": "citations", "score": None, "comment": "n/a: not a grounded answer"}
     known = set(outputs.get("sources") or [])
-    cited = [c.strip() for c in CITATION.findall(outputs["answer"])]
+    cited = self_rag.cited_labels(outputs["answer"])   # same parser as the pipeline
     if not cited:
         return {"key": "citations", "score": 0.0, "comment": "no citations"}
     invalid = [c for c in cited if c not in known]
