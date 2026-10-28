@@ -173,19 +173,21 @@ llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
 class State(TypedDict, total=False):
     """Data flowing through the graph; each node returns only what it changes."""
     question: str
-    # decide_retrieval
-    need_retrieval: bool
-    # retrieve
-    docs: List[Document]
-    # generate_direct
-    answer: str
-    # grade_documents
-    relevant_docs: List[Document]
-    # generate
-    context: str
+    
+    need_retrieval: bool # decide_retrieval
+    
+    docs: List[Document] # retrieve
+    
+    answer: str # generate_direct
+    
+    relevant_docs: List[Document]   # grade_documents
+    
+    context: str    # generate
     support: Literal["fully_supported", "partially_supported", "no_support"]
     evidence: List[str]
     support_reason: str
+        
+    revisions: int  # revise_answer
 
 
 # 4) NODES (in execution order)
@@ -388,6 +390,40 @@ def check_support(state: State) -> State:
             "support_reason": out.explanation}
 
 
+# ---------- Node: REVISE an answer that is not fully supported ----------
+revise_prompt = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            "You rewrite an answer so that it is fully supported by the CONTEXT.\n\n"
+            "Rules:\n"
+            "- Keep only facts stated in the context; remove everything the reviewer "
+            "flagged and any other interpretation, judgement or inferred link.\n"
+            "- Stay close to the wording of the context; quote it where helpful.\n"
+            "- If the question asks for something the documents do not describe "
+            "directly (e.g. 'culture'), say so, then list what they do state.\n"
+            "- Put the source label after each fact, e.g. [Company_Policies.pdf p.1].\n"
+            "- The symbol ■ stands for the Indian rupee sign (₹).\n"
+            "- If nothing in the context answers the question, reply exactly: "
+            "\"{no_answer}\"",
+        ),
+        (
+            "human",
+            "Question: {question}\n\nCurrent answer:\n{answer}\n\n"
+            "Reviewer feedback:\n{feedback}\n\nContext:\n{context}",
+        ),
+    ]
+)
+
+
+def revise_answer(state: State) -> State:
+    out = (revise_prompt | llm).invoke(
+        {"question": state["question"], "answer": state["answer"],
+         "feedback": state["support_reason"], "context": state["context"],
+         "no_answer": NO_ANSWER}
+    )
+    return {"answer": out.content, "revisions": state.get("revisions", 0) + 1}
+
 
 # ---------- Routing ----------
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
@@ -396,11 +432,21 @@ def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
 def route_after_grade(state: State) -> Literal["generate", "no_answer"]:
     return "generate" if state.get("relevant_docs") else "no_answer"
 
+
+def route_after_support(state: State) -> Literal["revise_answer", "accept"]:
+    if state["support"] == "fully_supported":
+        return "accept"
+    if state.get("revisions", 0) >= MAX_REVISIONS:
+        return "accept"   # give up revising; usefulness is judged next
+    return "revise_answer"
+
+
 # BUILD GRAPH
 def build_graph():
     """START -> decide_retrieval -> (generate_direct
                                      | retrieve -> grade_documents
-                                       -> (generate -> check_support | no_answer)) -> END"""
+                                       -> (generate -> check_support <-> revise_answer
+                                           | no_answer)) -> END"""
     g = StateGraph(State)
     g.add_node("decide_retrieval", decide_retrieval)
     g.add_node("generate_direct", generate_direct)
@@ -409,6 +455,8 @@ def build_graph():
     g.add_node("generate", generate)
     g.add_node("no_answer", no_answer)
     g.add_node("check_support", check_support)
+    g.add_node("revise_answer", revise_answer)
+
 
     g.add_edge(START, "decide_retrieval")
     g.add_conditional_edges(
@@ -424,7 +472,12 @@ def build_graph():
         {"generate": "generate", "no_answer": "no_answer"},
     )
     g.add_edge("generate", "check_support")
-    g.add_edge("check_support", END)
+    g.add_conditional_edges(
+        "check_support",
+        route_after_support,
+        {"revise_answer": "revise_answer", "accept": END},
+    )
+    g.add_edge("revise_answer", "check_support")
     g.add_edge("no_answer", END)
     return g.compile()
 
@@ -445,13 +498,22 @@ def print_result(res: State) -> None:
     print("QUESTION:", res["question"])
     print("NEED RETRIEVAL:", res.get("need_retrieval"))
 
+    if res.get("docs"):
+        relevant = res.get("relevant_docs", [])
+        print(f"\nRETRIEVED CHUNKS ({len(relevant)}/{len(res['docs'])} relevant):")
+        for d in res["docs"]:
+            mark = "keep" if d in relevant else "drop"
+            preview = d.page_content[:80].replace("\n", " ")
+            print(f"  [{mark}] {d.metadata.get('source', '?')} "
+                  f"p.{d.metadata.get('page', '?')}: {preview}")
+
     if res.get("support"):
         print(f"\nSUPPORT: {res['support']} (revisions: {res.get('revisions', 0)})")
         print(f"  {res['support_reason']}")
         for quote in res.get("evidence", []):
             print(f'  > "{quote}"')
 
-    print("\nANSWER:\n" + res.get("answer", "(none yet)"))
+    print("\nANSWER:\n" + res.get("answer", "(none)"))
 
 
 def main() -> None:
