@@ -18,13 +18,14 @@ import contextvars
 import hashlib
 import json
 import logging
+import operator
 import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
-from typing import List, Literal, Optional, TypedDict
+from typing import Annotated, List, Literal, Optional, TypedDict
 
 # ---------- Third-party ----------
 from dotenv import load_dotenv
@@ -68,6 +69,17 @@ MAX_CONCURRENCY = 10    # parallel LLM calls when grading chunks
 MAX_REVISIONS = 2       # support-driven rewrites per answer
 MAX_REWRITES = 2        # retrieval retries with a rewritten query
 RECURSION_LIMIT = 50    # max graph steps per question (worst case uses 41)
+
+# LLM call budget per question (.env MAX_LLM_CALLS). Once reached, no new attempt starts
+# (rewrite, web search, revision); a step already started finishes, so the total can go
+# over by at most one attempt. The loop limits above allow about 36 calls in the worst
+# case; the evals used at most 18.
+try:
+    MAX_LLM_CALLS = int(os.getenv("MAX_LLM_CALLS") or 30)
+except ValueError:
+    raise ValueError(f"MAX_LLM_CALLS={os.getenv('MAX_LLM_CALLS')!r}: expected an integer") from None
+if MAX_LLM_CALLS < 1:
+    raise ValueError(f"MAX_LLM_CALLS={MAX_LLM_CALLS}: must be at least 1")
 
 NO_ANSWER = "I couldn't find this in the available sources."
 GRAPH_PNG = "self_rag_graph.png"
@@ -134,6 +146,7 @@ def run_config(index: PdfIndex, kb_description: str) -> RunnableConfig:
             "llm_reasoning_effort": LLM_REASONING_EFFORT or "default",
             "embed_model": EMBED_MODEL,
             "retriever_k": cfg.retriever_k,
+            "max_llm_calls": MAX_LLM_CALLS,
             "chunk_size": cfg.chunk_size,
             "chunk_overlap": cfg.chunk_overlap,
             "kb_description_source": "config" if cfg.kb_description else "generated",
@@ -175,6 +188,8 @@ CONTEXT_IS_DATA = (
 class State(TypedDict, total=False):
     """Data flowing through the graph; each node returns only what it changes."""
     question: str
+    # every node that calls the LLM returns how many calls it made; they are summed
+    llm_calls: Annotated[int, operator.add]
     # decide_retrieval
     scope: Literal["general", "knowledge_base", "external"]
     need_retrieval: bool                   # scope != "general"
@@ -240,7 +255,8 @@ def decide_retrieval(state: State, config: RunnableConfig) -> State:
         {"question": state["question"],
          "kb_description": corpus_context(config)["kb_description"]}
     )
-    return {"scope": decision.scope, "need_retrieval": decision.scope != "general"}
+    return {"scope": decision.scope, "need_retrieval": decision.scope != "general",
+            "llm_calls": 1}
 
 
 # ---------- Node: DIRECT answer (no retrieval) ----------
@@ -257,7 +273,8 @@ direct_chain = ChatPromptTemplate.from_messages(
 
 
 def generate_direct(state: State) -> State:
-    return {"answer": direct_chain.invoke({"question": state["question"]}).content}
+    return {"answer": direct_chain.invoke({"question": state["question"]}).content,
+            "llm_calls": 1}
 
 
 # ---------- Node: RETRIEVE ----------
@@ -316,7 +333,8 @@ def grade_documents(state: State, config: RunnableConfig) -> State:
           "kb_description": kb_description} for d in docs],
         config,
     )
-    return {"relevant_docs": [d for d, g in zip(docs, grades)
+    return {"llm_calls": len(docs),
+            "relevant_docs": [d for d, g in zip(docs, grades)
                               if g.same_entity and g.on_topic]}
 
 
@@ -385,7 +403,7 @@ def generate(state: State, config: RunnableConfig) -> State:
         {"question": state["question"], "context": context,
          "kb_description": corpus_context(config)["kb_description"]}
     )
-    return {"answer": answer.content, "context": context}
+    return {"answer": answer.content, "context": context, "llm_calls": 1}
 
 
 # ---------- Node: CHECK SUPPORT (IsSUP) ----------
@@ -424,19 +442,21 @@ support_chain = ChatPromptTemplate.from_messages(
 
 
 def check_support(state: State) -> State:
-    """Citations are checked in code first; the LLM support check runs only on valid ones."""
+    """Citations are checked in code first; the LLM support check runs only on valid ones,
+    unless no revision can follow (revision limit or LLM budget reached): then it always runs,
+    so no answer is accepted unverified."""
     if is_not_found(state["answer"]):  # nothing claimed, nothing to verify
         return {"citation_errors": [], "support": "fully_supported", "evidence": [],
                 "support_reason": "The answer states that nothing was found."}
     errors = citation_errors(state["answer"], state.get("relevant_docs", []))
-    if errors and state.get("revisions", 0) < MAX_REVISIONS:   # last attempt: still verify
+    if errors and can_revise(state):
         return {"citation_errors": errors, "support": None, "evidence": [],
                 "support_reason": "Citation problems: " + "; ".join(errors) + ". Cite every "
                                   "fact with a source label copied exactly from the context, "
                                   "in square brackets."}
     out = support_chain.invoke({"answer": state["answer"], "context": state["context"]})
     return {"citation_errors": errors, "support": out.support, "evidence": out.evidence,
-            "support_reason": out.explanation}
+            "support_reason": out.explanation, "llm_calls": 1}
 
 
 # ---------- Node: REVISE an answer that is not fully supported ----------
@@ -466,7 +486,7 @@ def revise_answer(state: State) -> State:
         {"question": state["question"], "answer": state["answer"],
          "feedback": state["support_reason"], "context": state["context"]}
     )
-    return {"answer": out.content, "revisions": state.get("revisions", 0) + 1}
+    return {"answer": out.content, "revisions": state.get("revisions", 0) + 1, "llm_calls": 1}
 
 
 # ---------- Node: CHECK USEFULNESS (IsUSE) ----------
@@ -503,7 +523,7 @@ def check_usefulness(state: State, config: RunnableConfig) -> State:
         {"question": state["question"], "answer": state["answer"],
          "kb_description": corpus_context(config)["kb_description"]}
     )
-    return {"usefulness": out.usefulness, "usefulness_reason": out.reason}
+    return {"usefulness": out.usefulness, "usefulness_reason": out.reason, "llm_calls": 1}
 
 
 # ---------- Node: REWRITE the question for internal retrieval ----------
@@ -538,7 +558,7 @@ def rewrite_question(state: State, config: RunnableConfig) -> State:
          "kb_description": corpus_context(config)["kb_description"]}
     )
     return {"retrieval_query": out.query, "rewrites": state.get("rewrites", 0) + 1,
-            **fresh_pass()}
+            "llm_calls": 1, **fresh_pass()}
 
 
 # ---------- Node: REWRITE the question for web search ----------
@@ -567,7 +587,8 @@ def rewrite_web_query(state: State) -> State:
     out = web_query_chain.invoke(
         {"question": state["question"], "today": date.today().isoformat()}
     )
-    return {"web_query": out.query, "web_time_range": out.time_range, **fresh_pass()}
+    return {"web_query": out.query, "web_time_range": out.time_range, "llm_calls": 1,
+            **fresh_pass()}
 
 
 # ---------- Node: WEB SEARCH (at most once per question) ----------
@@ -599,6 +620,15 @@ def no_answer(state: State) -> State:
 # ======================================================================
 # ROUTING
 # ======================================================================
+def budget_reached(state: State) -> bool:
+    """The question has used MAX_LLM_CALLS: no new attempt may start."""
+    return state.get("llm_calls", 0) >= MAX_LLM_CALLS
+
+
+def can_revise(state: State) -> bool:
+    return state.get("revisions", 0) < MAX_REVISIONS and not budget_reached(state)
+
+
 def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
     return "generate_direct" if state["scope"] == "general" else "retrieve"
 
@@ -609,7 +639,10 @@ def next_attempt(state: State) -> Literal["rewrite_question", "rewrite_web_query
     knowledge_base: rewritten internal searches only; the web is no authority on the
                     knowledge base's own organization, so not found means not found.
     external:       one web search after the first internal pass, no internal rewrites.
+    Once the LLM budget is reached, nothing new is tried.
     """
+    if budget_reached(state):
+        return "no_answer"
     if state.get("scope") == "knowledge_base":
         if state.get("rewrites", 0) < MAX_REWRITES:
             return "rewrite_question"
@@ -628,7 +661,7 @@ def route_after_grade(state: State) -> str:
 
 
 def route_after_support(state: State) -> Literal["revise_answer", "accept"]:
-    if state.get("revisions", 0) >= MAX_REVISIONS:
+    if not can_revise(state):   # revision limit or LLM budget reached
         return "accept"
     if state.get("citation_errors") or state.get("support") != "fully_supported":
         return "revise_answer"
@@ -724,6 +757,8 @@ def answer_path(res: State) -> Literal["direct", "docs", "web", "no_answer"]:
 def print_result(res: State) -> None:
     print("=" * 100)
     print("QUESTION:", res["question"])
+    print(f"LLM CALLS: {res.get('llm_calls', 0)} (budget {MAX_LLM_CALLS}"
+          + (", reached: no further attempts)" if budget_reached(res) else ")"))
     print("SCOPE:", res.get("scope"))
     print("PATH:", answer_path(res))
     if res.get("rewrites"):

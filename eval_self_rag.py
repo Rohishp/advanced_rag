@@ -206,6 +206,9 @@ def make_target(index: PdfIndex):
             _call_counter.reset(token)
         path = self_rag.answer_path(res)
         cost, unpriced = cost_usd(counter.tokens, prices)
+        if res.get("llm_calls", 0) != counter.calls:   # a node that misreports its calls
+            log.warning("%r: pipeline counted %s LLM calls, callback counted %d",
+                        inputs["question"], res.get("llm_calls", 0), counter.calls)
         grounded = path in ("docs", "web")
         return {
             "answer": res.get("answer", ""),
@@ -225,6 +228,8 @@ def make_target(index: PdfIndex):
             "web_searched": bool(res.get("web_searched")),
             "web_error": res.get("web_error") or "",
             "llm_calls": counter.calls,
+            "pipeline_llm_calls": res.get("llm_calls", 0),
+            "budget_reached": self_rag.budget_reached(res),
             "tokens": {m: dict(t) for m, t in counter.tokens.items()},
             "cost_usd": cost,
             "unpriced_models": unpriced,
@@ -468,7 +473,8 @@ def summarize(rows: List[dict], experiment: str, corpus: str, reps: int, mode: s
         detail = {k: out.get(k) for k in ("path", "scope", "rewrites", "web_searched",
                                           "web_error", "kept",
                                           "dropped", "usefulness", "usefulness_reason",
-                                          "llm_calls", "tokens", "cost_usd")}
+                                          "llm_calls", "budget_reached", "tokens",
+                                          "cost_usd")}
         detail["answer"] = (out.get("answer") or "")[:600]
         if out.get("error"):
             detail["error"] = out["error"]
