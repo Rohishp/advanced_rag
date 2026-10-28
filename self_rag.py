@@ -557,7 +557,7 @@ usefulness_chain = ChatPromptTemplate.from_messages(
         (
             "system",
             "Judge whether the ANSWER gives the user what the QUESTION asks for.\n"
-            "The knowledge base contains {kb_description}.\n"
+            "{source_note}\n"
             "- useful: it provides the requested information, even if it notes a "
             "limitation.\n"
             "- not_useful: it says the information was not found (in any wording); it is "
@@ -572,13 +572,29 @@ usefulness_chain = ChatPromptTemplate.from_messages(
 ) | llm.with_structured_output(UsefulnessCheck)
 
 
+# For external questions the knowledge base is the wrong yardstick: with its description in
+# the prompt, correct web answers were judged "not about <the knowledge base's organization>"
+# (decisions S10.11, S11.7).
+EXTERNAL_SOURCE_NOTE = (
+    "The question is about something outside the knowledge base and was answered from web "
+    "search results; that is expected and no reason for not_useful."
+)
+
+
+def usefulness_source_note(state: State, config: RunnableConfig) -> str:
+    """What the usefulness check is told about where the answer may come from, by scope."""
+    if state.get("scope") == "external":
+        return EXTERNAL_SOURCE_NOTE
+    return f"The knowledge base contains {corpus_context(config)['kb_description']}."
+
+
 def check_usefulness(state: State, config: RunnableConfig) -> State:
     if is_not_found(state["answer"]):
         return {"usefulness": "not_useful",
                 "usefulness_reason": "The answer states that nothing was found."}
     out = usefulness_chain.invoke(
         {"question": state["question"], "answer": state["answer"],
-         "kb_description": corpus_context(config)["kb_description"]}
+         "source_note": usefulness_source_note(state, config)}
     )
     return {"usefulness": out.usefulness, "usefulness_reason": out.reason, "llm_calls": 1}
 
