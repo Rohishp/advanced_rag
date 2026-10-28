@@ -16,6 +16,7 @@ The graph flow is documented in build_graph().
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import date
 from pathlib import Path
@@ -74,8 +75,22 @@ def corpus_context(config: RunnableConfig) -> dict:
 
 
 def run_config(index: PdfIndex, kb_description: str) -> RunnableConfig:
+    """Invoke config: corpus objects for the nodes, plus labels for LangSmith traces."""
+    cfg = index.cfg
     return {
         "recursion_limit": RECURSION_LIMIT,
+        "run_name": "self_rag",
+        "tags": [f"corpus:{cfg.name}"],
+        "metadata": {
+            "corpus": cfg.name,
+            "collection": cfg.collection,
+            "llm_model": LLM_MODEL,
+            "embed_model": EMBED_MODEL,
+            "retriever_k": cfg.retriever_k,
+            "chunk_size": cfg.chunk_size,
+            "chunk_overlap": cfg.chunk_overlap,
+            "kb_description_source": "config" if cfg.kb_description else "generated",
+        },
         "configurable": {
             "kb_description": kb_description,
             "retriever": index.store.as_retriever(
@@ -651,6 +666,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def report_tracing() -> None:
+    """One line on whether LangSmith tracing is active (it is configured only via .env)."""
+    if os.getenv("LANGSMITH_TRACING", "").strip().lower() != "true":
+        print("LangSmith tracing: off (set LANGSMITH_TRACING=true in .env)")
+    elif not os.getenv("LANGSMITH_API_KEY"):
+        print("LangSmith tracing: LANGSMITH_TRACING is true but LANGSMITH_API_KEY is missing")
+    else:
+        print(f"LangSmith tracing: on, project '{os.getenv('LANGSMITH_PROJECT', 'default')}'")
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     if args.command == "init":
@@ -673,6 +698,7 @@ def main(argv=None) -> None:
     if not questions:
         sys.exit(f"Corpus '{index.cfg.name}' has no test_questions.")
 
+    report_tracing()
     app = build_graph()
     config = run_config(index, kb_description_for(index))
     for q in questions:
