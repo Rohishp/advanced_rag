@@ -94,8 +94,8 @@ def web_retryable(e: Exception) -> bool:
 
 def search_web(query: str, time_range: Optional[str] = None) -> dict:
     """One Tavily search with WEB_TIMEOUT_S per request, retried with backoff."""
-    key = os.getenv("TAVILY_API_KEY")
-    if not key:   # never fall back to Tavily's keyless mode
+    key = (os.getenv("TAVILY_API_KEY") or "").strip()
+    if not key:   # unset or blank; never fall back to Tavily's keyless mode
         raise RuntimeError("TAVILY_API_KEY is not set")
 
     def once() -> dict:
@@ -180,6 +180,7 @@ class State(TypedDict, total=False):
     web_query: str
     web_time_range: Optional[Literal["day", "week", "month", "year"]]
     web_searched: bool
+    web_error: str                         # why the web search failed; "" if it did not
     # retrieve, web_search
     docs: List[Document]
     # grade_documents
@@ -566,20 +567,23 @@ def rewrite_web_query(state: State) -> State:
 
 # ---------- Node: WEB SEARCH (at most once per question) ----------
 def web_search(state: State) -> State:
-    """Page text goes into page_content; title and URL into metadata."""
+    """Page text goes into page_content; title and URL into metadata.
+
+    A failure (no API key, a non-retryable error, retries used up) is recorded in
+    web_error and routes to no_answer; no results is not a failure.
+    """
     try:
         response = search_web(state["web_query"], state.get("web_time_range"))
-    except Exception as e:  # missing API key, retries used up, ...
-        print(f"Web search failed: {e}")
-        response = {}
+    except Exception as e:
+        return {"docs": [], "relevant_docs": [], "web_searched": True,
+                "web_error": f"{type(e).__name__}: {e}"}
 
-    results = response.get("results", []) if isinstance(response, dict) else []
     docs = [
         Document(page_content=r["content"],
                  metadata={"source": r.get("title") or "web", "url": r.get("url", "")})
-        for r in results if r.get("content")
+        for r in response.get("results", []) if r.get("content")
     ]
-    return {"docs": docs, "web_searched": True}
+    return {"docs": docs, "web_searched": True, "web_error": ""}
 
 
 # ---------- Node: NO ANSWER ----------
@@ -608,6 +612,10 @@ def next_attempt(state: State) -> Literal["rewrite_question", "rewrite_web_query
     if not state.get("web_searched"):
         return "rewrite_web_query"
     return "no_answer"
+
+
+def route_after_web_search(state: State) -> Literal["grade_documents", "no_answer"]:
+    return "no_answer" if state.get("web_error") else "grade_documents"
 
 
 def route_after_grade(state: State) -> str:
@@ -644,7 +652,8 @@ def build_graph():
     next attempt, by scope (see next_attempt):
          knowledge_base: rewrite_question -> retrieve (up to MAX_REWRITES), then no_answer
          external:       rewrite_web_query -> web_search -> grade_documents (once),
-                         then no_answer
+                         then no_answer; a failed web search (web_error) goes
+                         straight to no_answer
     """
     g = StateGraph(State)
     for name, node in [
@@ -679,7 +688,8 @@ def build_graph():
 
     g.add_edge("rewrite_question", "retrieve")
     g.add_edge("rewrite_web_query", "web_search")
-    g.add_edge("web_search", "grade_documents")
+    g.add_conditional_edges("web_search", route_after_web_search,
+                            {"grade_documents": "grade_documents", "no_answer": "no_answer"})
     g.add_edge("no_answer", END)
     return g.compile()
 
@@ -715,6 +725,8 @@ def print_result(res: State) -> None:
         print(f"REWRITES: {res['rewrites']}/{MAX_REWRITES} (last query: {res['retrieval_query']})")
     if res.get("web_searched"):
         print(f"WEB QUERY: {res.get('web_query')} (time_range={res.get('web_time_range')})")
+    if res.get("web_error"):
+        print(f"WEB ERROR: {res['web_error']}")
 
     if res.get("docs"):
         relevant = res.get("relevant_docs", [])
