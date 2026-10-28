@@ -287,6 +287,11 @@ def retrieve(state: State) -> State:
 
 # ---------- Node: GRADE retrieved chunks (topic-level, lenient) ----------
 class RelevanceGrade(BaseModel):
+    # the subject comes before the verdict so the model compares names first
+    chunk_subject: str = Field(
+        description="The main organization, person, product or topic of the chunk, "
+                    "using the exact name as written in the chunk."
+    )
     is_relevant: bool = Field(
         description="True if the chunk is about the same entity or topic area as the question."
     )
@@ -301,9 +306,13 @@ relevance_prompt = ChatPromptTemplate.from_messages(
             "A chunk is relevant if it discusses the same entity or topic area as the "
             "question. It does NOT need to contain the exact answer; whether the answer "
             "is supported is checked later.\n\n"
+            "First name the chunk's main subject exactly as written in the chunk, then "
+            "compare it with the question.\n"
             "A chunk is NOT relevant if it is about a clearly different subject, or "
             "about a different organization, person or product than the one asked "
-            "about, even if the names are similar.\n"
+            "about. Different names are different entities, even if they share a word, "
+            "prefix or spelling (a name with an extra or different word is another "
+            "entity).\n"            
             "When unsure, set is_relevant=true.",
         ),
         ("human", "Question: {question}\n\nChunk:\n{chunk}"),
