@@ -1,0 +1,13 @@
+   offline-tests:
+     image: python:3.10
+     timeout: 15m
+     cache:
+       paths: [.cache/pip]
+     variables:
+       PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+     script:
+       - python -m pip install -r requirements.txt
+       - python tests/run_all.py
+     rules:
+       - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+       - if: $CI_PIPELINE_SOURCE == "merge_request_event"
