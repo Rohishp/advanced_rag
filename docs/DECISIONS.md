@@ -23,10 +23,10 @@ uninterpretable; and a perfect score can hide a broken check.
 **Decision.** Switch the eval judge first and re-baseline on unchanged code, then compare
 pipeline models on quality per cost. Add harder cases when the set saturates. Eval
 expectations change only with an explicit, logged reason.
-**Evidence.** On the same 19 cases and judge, `gpt-6-luna` scored 0.98 correctness at $0.59
-per 1,000 questions, against 0.96 at $5.02 for the previous model (`sol-judge-baseline` →
-`luna-none`); its `low` effort variant was rejected for a self-contradicting answer despite
-similar averages. Three harder web cases dropped
+**Evidence.** On the same 19 cases and judge, switching the pipeline to `gpt-6-luna` cut the
+cost from $5.02 to $0.59 per 1,000 questions at 0.98 correctness, against 0.96 before
+(`sol-judge-baseline` → `luna-none`); today's `main` is at 1.00 and $0.57. Its `low` effort
+variant was rejected for a self-contradicting answer despite similar averages. Three harder web cases dropped
 correctness to 0.94: the usefulness check rejected correct answers as "not about the
 knowledge base's company" (5 times in two evals). Telling it the question's scope restored
 1.00 (`web-cases` → `usefulness-scope`).

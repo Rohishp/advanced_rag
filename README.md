@@ -1,6 +1,6 @@
-# advanced_rag: eval-driven Self-RAG over your own PDFs
+# self-correcting-rag: eval-driven Self-RAG over your own PDFs
 
-[![tests](https://github.com/Rohishp/advanced_rag/actions/workflows/tests.yml/badge.svg)](https://github.com/Rohishp/advanced_rag/actions/workflows/tests.yml)
+[![tests](https://github.com/Rohishp/self-correcting-rag/actions/workflows/tests.yml/badge.svg)](https://github.com/Rohishp/self-correcting-rag/actions/workflows/tests.yml)
 
 Point it at a folder of PDFs and ask questions. Every fact in the answer cites the file,
 page and section it came from, and when the documents do not contain the answer, it says so
@@ -9,21 +9,23 @@ if a 3-repetition eval run against a stronger judge model held or improved the s
 
 ## Results
 
-Same 19 questions, first baseline vs. today's `main` (synthetic company corpus, each question
-run 3 times):
+Same 19 questions, same judge (`gpt-6.1-sol`), each question run 3 times, synthetic
+company corpus:
 
-| | Baseline | Now |
+| | Re-baseline (`gpt-5.4-mini`) | Now (`gpt-6-luna`) |
 |---|---|---|
-| Correctness (expected facts stated; correct "not found" on gaps) | 0.93 | **1.00** |
-| Faithfulness (claims supported by the retrieved text) | 0.98 | **1.00** |
-| Citation validity (cited sources exist in the context) | 0.93 | **1.00** |
-| Path (direct / documents / web / declined, as expected) | 0.91 | **1.00** |
-| LLM calls per question | 13.2 | **9.4** |
-| Mean latency | 11.0 s | **8.4 s** |
-| Pipeline cost per 1,000 questions | $5.02 ¹ | **$0.57** |
+| Correctness (expected facts stated; correct "not found" on gaps) | 0.96 | **1.00** |
+| Faithfulness (claims supported by the retrieved text) | 1.00 | **1.00** |
+| Citation validity (cited sources exist in the context) | 0.95 | **1.00** |
+| Path (direct / documents / web / declined, as expected) | 1.00 | **1.00** |
+| LLM calls per question | 9.5 | **9.4** |
+| Mean latency | 7.0 s | 8.4 s |
+| Pipeline cost per 1,000 questions | $5.02 | **$0.57** |
 
-¹ First cost measurement, with the original pipeline model; the baseline scores above were
-judged by `gpt-5.4`, today's by `gpt-6.1-sol`.
+The cheaper model is slower per call; that latency was accepted for a nearly 9× lower cost. Before
+the judge switch, under the first judge (`gpt-5.4`), scope routing and entity-aware grading
+had taken correctness from 0.93 to 0.98 (`baseline` → `grader-multipart` in
+[docs/RESULTS.md](docs/RESULTS.md)).
 
 Also on today's `main`:
 
@@ -69,7 +71,7 @@ the eval evidence:
 1. A confident answer about the wrong company is the worst failure: scope routing and
    entity-aware grading (CFO question 0.33 → 1.00).
 2. Measure the measurement: switch the judge first, then compare models; a cheaper model at
-   equal quality ($5.02 → $0.59 per 1,000 questions).
+   equal quality ($5.02 → $0.57 per 1,000 questions, same judge).
 3. Root-cause library behaviour (`batch()` losing traces in LangGraph nodes; an eval option
    that still uploaded) instead of working around it.
 4. Say no to your own feature: a refinement step built, measured at −7.6% cost, and reverted.
